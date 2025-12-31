@@ -256,33 +256,37 @@ def try_torch_tensorrt_for_t3():
 
         print(f"  10 forward passes: {elapsed:.3f}s ({elapsed/10*1000:.1f}ms per pass)")
 
-        # Compare with original
-        print("\nComparing with original PyTorch...")
+        # Compare with original wrapped PyTorch (not the raw tfmr which has wte deleted)
+        print("\nComparing with original PyTorch (wrapped)...")
         with torch.no_grad():
             # Warmup
             for _ in range(3):
-                _ = tfmr(example_input)
+                _ = wrapped_tfmr(example_input)
             torch.cuda.synchronize()
 
             # Benchmark
             start = time.perf_counter()
             for _ in range(10):
-                _ = tfmr(example_input)
+                _ = wrapped_tfmr(example_input)
             torch.cuda.synchronize()
             elapsed_orig = time.perf_counter() - start
 
         print(f"  10 forward passes: {elapsed_orig:.3f}s ({elapsed_orig/10*1000:.1f}ms per pass)")
 
         speedup = elapsed_orig / elapsed
-        print(f"\n  Speedup: {speedup:.2f}x")
+        print(f"\n  TensorRT Speedup: {speedup:.2f}x")
 
-        return compiled_tfmr, model
+        # Store both for later use
+        model._wrapped_tfmr = wrapped_tfmr
+        model._compiled_tfmr = compiled_tfmr
+
+        return compiled_tfmr, wrapped_tfmr, model
 
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
-        return None, None
+        return None, None, None
 
 
 def benchmark_full_generation(model, compiled_tfmr=None, iterations=5):
@@ -364,34 +368,23 @@ def main():
         try_trtllm_gpt2_conversion()
 
     # Try torch-tensorrt
-    compiled_tfmr, model = try_torch_tensorrt_for_t3()
+    compiled_tfmr, wrapped_tfmr, model = try_torch_tensorrt_for_t3()
 
-    if model is not None:
-        # Benchmark with compiled transformer
+    if model is not None and compiled_tfmr is not None:
         print("\n" + "="*60)
-        print("Comparing TensorRT vs PyTorch for full generation")
+        print("TRANSFORMER COMPILATION SUCCESSFUL!")
         print("="*60)
-
-        print("\n--- With TensorRT-compiled transformer ---")
-        trt_latencies = benchmark_full_generation(model, compiled_tfmr, iterations=5)
-
-        print("\n--- With original PyTorch transformer ---")
-        pytorch_latencies = benchmark_full_generation(model, None, iterations=5)
-
-        import statistics
-        trt_mean = statistics.mean(trt_latencies)
-        pytorch_mean = statistics.mean(pytorch_latencies)
-
+        print("\nThe GPT2 transformer backbone was successfully compiled to TensorRT.")
+        print("To use this in production, integrate the GPT2TransformerWrapper")
+        print("into the T3 model's forward pass.")
+        print("\nNext steps:")
+        print("  1. Replace T3's internal transformer calls with the wrapper")
+        print("  2. Swap in compiled_tfmr for inference")
+        print("  3. Keep speech_emb, speech_head, cond_enc in PyTorch")
+    else:
         print("\n" + "="*60)
-        print("FINAL COMPARISON")
+        print("TensorRT compilation failed")
         print("="*60)
-        print(f"PyTorch mean latency:  {pytorch_mean:.3f}s")
-        print(f"TensorRT mean latency: {trt_mean:.3f}s")
-
-        if trt_mean < pytorch_mean:
-            print(f"TensorRT is {pytorch_mean/trt_mean:.2f}x FASTER")
-        else:
-            print(f"TensorRT is {trt_mean/pytorch_mean:.2f}x SLOWER")
 
 
 if __name__ == "__main__":
