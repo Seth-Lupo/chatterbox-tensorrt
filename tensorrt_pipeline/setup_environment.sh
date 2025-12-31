@@ -40,10 +40,15 @@ echo ""
 echo "Installing TensorRT..."
 pip install tensorrt==10.3.0 --extra-index-url https://pypi.nvidia.com
 
-# Install TensorRT-LLM
+# Install torch-tensorrt (primary TensorRT integration)
 echo ""
-echo "Installing TensorRT-LLM..."
-pip install tensorrt-llm==0.12.0 --extra-index-url https://pypi.nvidia.com
+echo "Installing torch-tensorrt..."
+pip install torch-tensorrt --extra-index-url https://pypi.nvidia.com
+
+# Install TensorRT-LLM (optional, for advanced LLM optimization)
+echo ""
+echo "Installing TensorRT-LLM (optional)..."
+pip install tensorrt-llm --extra-index-url https://pypi.nvidia.com || echo "TensorRT-LLM installation failed (optional, continuing...)"
 
 # Install other dependencies
 echo ""
@@ -69,7 +74,8 @@ echo ""
 echo "Verifying installation..."
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 python -c "import tensorrt; print(f'TensorRT: {tensorrt.__version__}')"
-python -c "import tensorrt_llm; print(f'TensorRT-LLM: {tensorrt_llm.__version__}')"
+python -c "import torch_tensorrt; print(f'torch-tensorrt: {torch_tensorrt.__version__}')"
+python -c "import tensorrt_llm; print(f'TensorRT-LLM: {tensorrt_llm.__version__}')" || echo "TensorRT-LLM: not installed (optional)"
 
 echo ""
 echo "=========================================="

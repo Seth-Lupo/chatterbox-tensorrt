@@ -34,13 +34,20 @@ def check_dependencies():
         print("ERROR: TensorRT not found. Run setup_environment.sh first.")
         sys.exit(1)
 
-    # Check TensorRT-LLM
+    # Check torch-tensorrt (primary method)
+    try:
+        import torch_tensorrt
+        print(f"  torch-tensorrt: {torch_tensorrt.__version__}")
+    except ImportError:
+        print("ERROR: torch-tensorrt not found. Install with: pip install torch-tensorrt")
+        sys.exit(1)
+
+    # Check TensorRT-LLM (optional)
     try:
         import tensorrt_llm
-        print(f"  TensorRT-LLM: {tensorrt_llm.__version__}")
+        print(f"  TensorRT-LLM: {tensorrt_llm.__version__} (optional)")
     except ImportError:
-        print("ERROR: TensorRT-LLM not found. Run setup_environment.sh first.")
-        sys.exit(1)
+        print("  TensorRT-LLM: not installed (optional)")
 
     # Check GPU
     if not torch.cuda.is_available():
@@ -53,67 +60,22 @@ def check_dependencies():
 
 
 def build_t3_engine(dtype: str = "float16", max_batch_size: int = 1, max_seq_len: int = 2048):
-    """Build TensorRT-LLM engine for T3."""
+    """Build TensorRT engine for T3 using torch-tensorrt."""
     print("\n" + "="*50)
-    print("Building T3 TensorRT-LLM Engine...")
+    print("Building T3 TensorRT Engine...")
     print("="*50)
 
     t3_checkpoint = EXPORTS_DIR / "t3_checkpoint"
-    t3_engine_dir = ENGINES_DIR / "t3_engine"
-    t3_engine_dir.mkdir(parents=True, exist_ok=True)
-
     if not t3_checkpoint.exists():
         print(f"ERROR: T3 checkpoint not found at {t3_checkpoint}")
         print("Run 01_export_models.py first.")
+        if STRICT_MODE:
+            raise RuntimeError(f"T3 checkpoint not found at {t3_checkpoint}")
         return False
 
-    # For TensorRT-LLM, we use the trtllm-build command or Python API
-    # Here we use Python API for more control
-
-    try:
-        from tensorrt_llm.builder import Builder
-        from tensorrt_llm.models import GPT2LMHeadModel
-        from tensorrt_llm.network import net_guard
-        from tensorrt_llm.plugin import PluginConfig
-        import tensorrt_llm
-
-        print(f"Building with dtype={dtype}, max_batch={max_batch_size}, max_seq={max_seq_len}")
-
-        # Plugin configuration
-        plugin_config = PluginConfig()
-        plugin_config.gpt_attention_plugin = dtype
-        plugin_config.gemm_plugin = dtype
-        plugin_config.set_context_fmha(True)
-
-        # Build configuration
-        builder = Builder()
-        builder_config = builder.create_builder_config(
-            name="t3_turbo",
-            precision=dtype,
-            max_batch_size=max_batch_size,
-            max_input_len=max_seq_len,
-            max_output_len=max_seq_len,
-        )
-
-        # Note: This is a simplified version. Full implementation would:
-        # 1. Load the exported weights
-        # 2. Create the TRT-LLM model graph
-        # 3. Build the engine
-
-        print("T3 engine build requires custom model definition.")
-        print("Using alternative approach with torch.compile + TensorRT backend...")
-
-        # Alternative: Use torch.compile with TensorRT backend
-        build_t3_with_torch_trt(dtype)
-
-        return True
-
-    except Exception as e:
-        print(f"TensorRT-LLM build failed: {e}")
-        if STRICT_MODE:
-            raise RuntimeError(f"T3 TensorRT-LLM build failed in strict mode: {e}")
-        print("Falling back to torch-tensorrt...")
-        return build_t3_with_torch_trt(dtype)
+    # Use torch-tensorrt for T3 (more compatible than TensorRT-LLM for custom models)
+    print(f"Building with dtype={dtype}, max_batch={max_batch_size}, max_seq={max_seq_len}")
+    return build_t3_with_torch_trt(dtype)
 
 
 def build_t3_with_torch_trt(dtype: str = "float16"):
