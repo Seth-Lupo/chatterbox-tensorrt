@@ -95,9 +95,9 @@ def convert_hf_to_trtllm():
             print(f"  {name} -> transformer.position_embedding.weight")
             continue
 
-        # Skip token embeddings (T3 doesn't use them)
+        # Token embeddings - skip if present (T3 deletes wte anyway)
         if name == "wte.weight":
-            print(f"  {name} -> SKIPPED (T3 uses custom embeddings)")
+            print(f"  {name} -> SKIPPED (will create dummy)")
             continue
 
         # Final layer norm
@@ -178,6 +178,15 @@ def convert_hf_to_trtllm():
             elif ".mlp.c_proj.bias" in name:
                 trtllm_weights[f"{layer_prefix}.mlp.proj.bias"] = weight
                 print(f"  {name} -> {layer_prefix}.mlp.proj.bias")
+
+    # Create dummy vocab_embedding and lm_head (T3 doesn't use these but TensorRT-LLM requires them)
+    vocab_size = hf_config["vocab_size"]
+    print(f"\n  Creating dummy vocab_embedding and lm_head (vocab_size={vocab_size}, hidden_size={hidden_size})")
+    dummy_embedding = np.zeros((vocab_size, hidden_size), dtype=np.float32)
+    trtllm_weights["transformer.vocab_embedding.weight"] = dummy_embedding
+    trtllm_weights["lm_head.weight"] = dummy_embedding
+    print(f"  -> transformer.vocab_embedding.weight (dummy zeros)")
+    print(f"  -> lm_head.weight (dummy zeros)")
 
     # Save as safetensors (TensorRT-LLM format)
     print(f"\nSaving to {TRTLLM_CHECKPOINT}...")
