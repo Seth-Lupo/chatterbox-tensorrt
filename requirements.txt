@@ -1,0 +1,16 @@
+torch
+torchaudio
+torchcodec
+numpy
+transformers
+diffusers
+librosa
+safetensors
+huggingface_hub
+omegaconf
+conformer
+s3tokenizer
+einops
+scipy
+tokenizers
+tqdm

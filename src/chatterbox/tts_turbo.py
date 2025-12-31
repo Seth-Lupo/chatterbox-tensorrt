@@ -3,14 +3,24 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import time
+from typing import Generator, Tuple, Optional
+
 import librosa
+import numpy as np
 import torch
-import perth
-import pyloudnorm as ln
+import torch.nn.functional as F
 
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
+from transformers.generation.logits_process import (
+    LogitsProcessorList,
+    RepetitionPenaltyLogitsProcessor,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 
 from .models.t3 import T3
 from .models.s3tokenizer import S3_SR
@@ -22,6 +32,18 @@ from .models.t3.modules.t3_config import T3Config
 from .models.s3gen.const import S3GEN_SIL
 import logging
 logger = logging.getLogger(__name__)
+
+
+def setup_cuda_optimizations():
+    """Enable CUDA optimizations for faster inference."""
+    if torch.cuda.is_available():
+        # Enable TF32 for Ampere+ GPUs (including L4)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Enable cudnn autotuner
+        torch.backends.cudnn.benchmark = True
+        # Disable debug/profiling overhead
+        torch.backends.cudnn.enabled = True
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
 
@@ -107,6 +129,16 @@ class Conditionals:
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 
+@dataclass
+class StreamingMetrics:
+    """Metrics for streaming TTS generation"""
+    latency_to_first_chunk: Optional[float] = None
+    rtf: Optional[float] = None
+    total_generation_time: Optional[float] = None
+    total_audio_duration: Optional[float] = None
+    chunk_count: int = 0
+
+
 class ChatterboxTurboTTS:
     ENC_COND_LEN = 15 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
@@ -119,6 +151,7 @@ class ChatterboxTurboTTS:
         tokenizer: EnTokenizer,
         device: str,
         conds: Conditionals = None,
+        dtype: torch.dtype = torch.float32,
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
@@ -127,17 +160,121 @@ class ChatterboxTurboTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self.dtype = dtype
+        self._compiled = False
+
+        # Pre-create logits processors (avoid recreating each call)
+        self._logits_processors_cache = {}
+
+    def compile_models(self, mode: str = "default"):
+        """
+        Compile models for faster inference.
+
+        Args:
+            mode: Compilation mode
+                - "default": torch.compile with default settings
+                - "reduce-overhead": Optimized for small batches (good for streaming)
+                - "max-autotune": Maximum optimization (slower compile, faster run)
+                - "tensorrt": Use TensorRT backend (requires torch-tensorrt)
+        """
+        if self._compiled:
+            logger.warning("Models already compiled, skipping")
+            return
+
+        logger.info(f"Compiling models with mode: {mode}")
+
+        if mode == "tensorrt":
+            try:
+                import torch_tensorrt
+                # TensorRT compilation for T3 transformer
+                self.t3.tfmr = torch_tensorrt.compile(
+                    self.t3.tfmr,
+                    inputs=[torch_tensorrt.Input(
+                        min_shape=[1, 1, 1024],
+                        opt_shape=[1, 512, 1024],
+                        max_shape=[1, 2048, 1024],
+                        dtype=torch.float16 if self.dtype == torch.float16 else torch.float32,
+                    )],
+                    enabled_precisions={torch.float16} if self.dtype == torch.float16 else {torch.float32},
+                    truncate_long_and_double=True,
+                )
+                logger.info("T3 compiled with TensorRT")
+            except ImportError:
+                logger.warning("torch-tensorrt not installed, falling back to torch.compile")
+                mode = "reduce-overhead"
+            except Exception as e:
+                logger.warning(f"TensorRT compilation failed: {e}, falling back to torch.compile")
+                mode = "reduce-overhead"
+
+        if mode != "tensorrt":
+            compile_kwargs = {}
+            if mode == "reduce-overhead":
+                compile_kwargs = {"mode": "reduce-overhead"}
+            elif mode == "max-autotune":
+                compile_kwargs = {"mode": "max-autotune"}
+
+            # Compile T3 transformer
+            self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
+            # Compile speech embedding and head
+            self.t3.speech_emb = torch.compile(self.t3.speech_emb, **compile_kwargs)
+            self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
+            # Compile S3Gen flow model
+            self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
+            logger.info(f"Models compiled with torch.compile (mode={mode})")
+
+        self._compiled = True
+
+    def to_half(self):
+        """Convert models to float16 for faster inference."""
+        self.dtype = torch.float16
+        self.t3 = self.t3.half()
+        self.s3gen = self.s3gen.half()
+        logger.info("Models converted to float16")
+        return self
+
+    def to_bfloat16(self):
+        """Convert models to bfloat16 (better for some ops)."""
+        self.dtype = torch.bfloat16
+        self.t3 = self.t3.to(torch.bfloat16)
+        self.s3gen = self.s3gen.to(torch.bfloat16)
+        logger.info("Models converted to bfloat16")
+        return self
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTurboTTS':
+    def from_local(
+        cls,
+        ckpt_dir,
+        device,
+        dtype: str = "float32",
+        compile_mode: Optional[str] = None,
+    ) -> 'ChatterboxTurboTTS':
+        """
+        Load model from local checkpoint.
+
+        Args:
+            ckpt_dir: Path to checkpoint directory
+            device: Device to load model on ("cuda", "cpu", "mps")
+            dtype: Data type ("float32", "float16", "bfloat16")
+            compile_mode: Compilation mode (None, "default", "reduce-overhead", "max-autotune", "tensorrt")
+        """
         ckpt_dir = Path(ckpt_dir)
+
+        # Setup CUDA optimizations
+        if device == "cuda":
+            setup_cuda_optimizations()
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
         if device in ["cpu", "mps"]:
             map_location = torch.device('cpu')
         else:
             map_location = None
+
+        # Determine torch dtype
+        torch_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(dtype, torch.float32)
 
         ve = VoiceEncoder()
         ve.load_state_dict(
@@ -160,14 +297,14 @@ class ChatterboxTurboTTS:
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         del t3.tfmr.wte
-        t3.to(device).eval()
+        t3.to(device=device, dtype=torch_dtype).eval()
 
         s3gen = S3Gen(meanflow=True)
         weights = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
         s3gen.load_state_dict(
             weights, strict=True
         )
-        s3gen.to(device).eval()
+        s3gen.to(device=device, dtype=torch_dtype).eval()
 
         tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
         if tokenizer.pad_token is None:
@@ -180,10 +317,45 @@ class ChatterboxTurboTTS:
         if builtin_voice.exists():
             conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        instance = cls(t3, s3gen, ve, tokenizer, device, conds=conds, dtype=torch_dtype)
+
+        # Compile if requested
+        if compile_mode:
+            instance.compile_models(compile_mode)
+
+        return instance
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTurboTTS':
+    def from_pretrained(
+        cls,
+        device: str,
+        dtype: str = "float32",
+        compile_mode: Optional[str] = None,
+    ) -> 'ChatterboxTurboTTS':
+        """
+        Load model from HuggingFace Hub.
+
+        Args:
+            device: Device to load model on ("cuda", "cpu", "mps")
+            dtype: Data type - affects precision and speed
+                - "float32": Full precision (default, most accurate)
+                - "float16": Half precision (faster, slight quality loss)
+                - "bfloat16": Brain float16 (faster, better precision than fp16)
+            compile_mode: Optional compilation for faster inference
+                - None: No compilation (default)
+                - "default": Basic torch.compile
+                - "reduce-overhead": Good for streaming (small batches)
+                - "max-autotune": Slowest compile, fastest runtime
+                - "tensorrt": Use TensorRT (requires torch-tensorrt)
+
+        Example:
+            # Fast inference on GPU with compilation
+            model = ChatterboxTurboTTS.from_pretrained(
+                device="cuda",
+                dtype="float16",
+                compile_mode="reduce-overhead"
+            )
+        """
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -199,29 +371,13 @@ class ChatterboxTurboTTS:
             allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"]
         )
 
-        return cls.from_local(local_path, device)
+        return cls.from_local(local_path, device, dtype=dtype, compile_mode=compile_mode)
 
-    def norm_loudness(self, wav, sr, target_lufs=-27):
-        try:
-            meter = ln.Meter(sr)
-            loudness = meter.integrated_loudness(wav)
-            gain_db = target_lufs - loudness
-            gain_linear = 10.0 ** (gain_db / 20.0)
-            if math.isfinite(gain_linear) and gain_linear > 0.0:
-                wav = wav * gain_linear
-        except Exception as e:
-            print(f"Warning: Error in norm_loudness, skipping: {e}")
-
-        return wav
-
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True):
-        ## Load and norm reference wav
+    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+        ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
         assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
-
-        if norm_loudness:
-            s3gen_ref_wav = self.norm_loudness(s3gen_ref_wav, _sr)
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
@@ -249,22 +405,17 @@ class ChatterboxTurboTTS:
         self,
         text,
         repetition_penalty=1.2,
-        min_p=0.00,
         top_p=0.95,
         audio_prompt_path=None,
         exaggeration=0.0,
-        cfg_weight=0.0,
         temperature=0.8,
         top_k=1000,
-        norm_loudness=True,
     ):
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
-        if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
-            logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
 
         # Norm and tokenize text
         text = punc_norm(text)
@@ -291,6 +442,271 @@ class ChatterboxTurboTTS:
             ref_dict=self.conds.gen,
             n_cfm_timesteps=2,
         )
+        wav = wav.squeeze(0).detach().cpu()
+        return wav.unsqueeze(0)
+
+    def _process_token_chunk(
+        self,
+        new_tokens: torch.Tensor,
+        all_tokens_so_far: torch.Tensor,
+        context_window: int,
+        start_time: float,
+        metrics: StreamingMetrics,
+        fade_duration: float = 0.02,
+    ) -> Tuple[Optional[torch.Tensor], float, bool]:
+        """Process a chunk of tokens and return audio."""
+        # Build tokens_to_process by including context window
+        if len(all_tokens_so_far) > 0:
+            context_tokens = (
+                all_tokens_so_far[-context_window:]
+                if len(all_tokens_so_far) > context_window
+                else all_tokens_so_far
+            )
+            tokens_to_process = torch.cat([context_tokens, new_tokens], dim=-1)
+            context_length = len(context_tokens)
+        else:
+            tokens_to_process = new_tokens
+            context_length = 0
+
+        # Filter invalid tokens
+        tokens_to_process = tokens_to_process[tokens_to_process < 6561]
+        if len(tokens_to_process) == 0:
+            return None, 0.0, False
+
+        tokens_to_process = tokens_to_process.to(self.device)
+
+        # Run S3Gen inference
+        wav, _ = self.s3gen.inference(
+            speech_tokens=tokens_to_process,
+            ref_dict=self.conds.gen,
+            n_cfm_timesteps=2,
+        )
         wav = wav.squeeze(0).detach().cpu().numpy()
-        watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+        # Crop out context portion - only return new audio
+        if context_length > 0:
+            samples_per_token = len(wav) / len(tokens_to_process)
+            skip_samples = int(context_length * samples_per_token)
+            audio_chunk = wav[skip_samples:]
+        else:
+            audio_chunk = wav
+
+        if len(audio_chunk) == 0:
+            return None, 0.0, False
+
+        # Apply fade-in to smooth chunk boundaries
+        fade_samples = int(fade_duration * self.sr)
+        if fade_samples > 0 and fade_samples < len(audio_chunk):
+            fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=audio_chunk.dtype)
+            audio_chunk[:fade_samples] *= fade_in
+
+        # Compute audio duration
+        audio_duration = len(audio_chunk) / self.sr
+        audio_tensor = torch.from_numpy(audio_chunk).unsqueeze(0)
+
+        # Update first-chunk latency metric
+        if metrics.chunk_count == 0:
+            metrics.latency_to_first_chunk = time.time() - start_time
+
+        metrics.chunk_count += 1
+        return audio_tensor, audio_duration, True
+
+    def generate_stream(
+        self,
+        text: str,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.0,
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        chunk_size: int = 25,
+        context_window: int = 50,
+        fade_duration: float = 0.02,
+    ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
+        """
+        Streaming TTS generation that yields audio chunks as they are generated.
+
+        Args:
+            text: Input text to synthesize
+            audio_prompt_path: Optional path to reference audio for voice cloning
+            exaggeration: Emotion exaggeration factor (not used in turbo)
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            repetition_penalty: Repetition penalty
+            chunk_size: Number of speech tokens per chunk
+            context_window: Number of previous tokens to include for audio coherence
+            fade_duration: Seconds to apply linear fade-in on each chunk
+
+        Yields:
+            Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
+        """
+        start_time = time.time()
+        metrics = StreamingMetrics()
+
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        total_audio_duration = 0.0
+        all_tokens = torch.tensor([], dtype=torch.long, device=self.device)
+        chunk_buffer = []
+
+        # Stream tokens from T3
+        with torch.inference_mode():
+            for token in self._inference_stream_turbo(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            ):
+                chunk_buffer.append(token)
+
+                # When we have enough tokens, process and yield audio
+                if len(chunk_buffer) >= chunk_size:
+                    new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
+
+                    audio_tensor, audio_duration, success = self._process_token_chunk(
+                        new_tokens, all_tokens, context_window, start_time, metrics, fade_duration
+                    )
+
+                    if success:
+                        total_audio_duration += audio_duration
+                        yield audio_tensor, metrics
+
+                    # Update all tokens
+                    all_tokens = torch.cat([all_tokens, new_tokens], dim=-1) if len(all_tokens) > 0 else new_tokens
+                    chunk_buffer = []
+
+            # Process remaining tokens in buffer
+            if chunk_buffer:
+                new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
+
+                audio_tensor, audio_duration, success = self._process_token_chunk(
+                    new_tokens, all_tokens, context_window, start_time, metrics, fade_duration
+                )
+
+                if success:
+                    total_audio_duration += audio_duration
+                    yield audio_tensor, metrics
+
+        # Final metrics
+        metrics.total_generation_time = time.time() - start_time
+        metrics.total_audio_duration = total_audio_duration
+        if total_audio_duration > 0:
+            metrics.rtf = metrics.total_generation_time / total_audio_duration
+
+    def _get_logits_processors(
+        self,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> LogitsProcessorList:
+        """Get or create cached logits processors."""
+        cache_key = (temperature, top_k, top_p, repetition_penalty)
+        if cache_key not in self._logits_processors_cache:
+            processors = LogitsProcessorList()
+            if temperature > 0 and temperature != 1.0:
+                processors.append(TemperatureLogitsWarper(temperature))
+            if top_k > 0:
+                processors.append(TopKLogitsWarper(top_k))
+            if top_p < 1.0:
+                processors.append(TopPLogitsWarper(top_p))
+            if repetition_penalty != 1.0:
+                processors.append(RepetitionPenaltyLogitsProcessor(repetition_penalty))
+            self._logits_processors_cache[cache_key] = processors
+        return self._logits_processors_cache[cache_key]
+
+    def _inference_stream_turbo(
+        self,
+        t3_cond: T3Cond,
+        text_tokens: torch.Tensor,
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        max_gen_len: int = 1000,
+    ) -> Generator[torch.Tensor, None, None]:
+        """
+        Streaming version of inference_turbo that yields tokens one at a time.
+        Optimized for minimal overhead per token.
+        """
+        # Get cached logits processors
+        logits_processors = self._get_logits_processors(
+            temperature, top_k, top_p, repetition_penalty
+        )
+
+        # Prepare initial embeddings
+        speech_start_token = self.t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+        embeds, _ = self.t3.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=speech_start_token,
+            cfg_weight=0.0,
+        )
+
+        # Pre-allocate token storage (avoid growing list)
+        generated_speech_tokens = torch.empty(
+            (1, max_gen_len + 1), dtype=torch.long, device=self.device
+        )
+        num_generated = 0
+
+        # Initial forward pass (includes full context)
+        llm_outputs = self.t3.tfmr(inputs_embeds=embeds, use_cache=True)
+        past_key_values = llm_outputs.past_key_values
+
+        # Get first token
+        speech_logits = self.t3.speech_head(llm_outputs[0][:, -1:])
+        processed_logits = logits_processors(speech_start_token, speech_logits[:, -1, :])
+        probs = F.softmax(processed_logits, dim=-1)
+        next_speech_token = torch.multinomial(probs, num_samples=1)
+
+        generated_speech_tokens[:, num_generated] = next_speech_token.squeeze()
+        num_generated += 1
+        yield next_speech_token
+
+        current_speech_token = next_speech_token
+        stop_token = self.t3.hp.stop_speech_token
+
+        # Main generation loop - optimized
+        for _ in range(max_gen_len):
+            # Embed current token
+            current_speech_embed = self.t3.speech_emb(current_speech_token)
+
+            # Forward pass with KV cache
+            llm_outputs = self.t3.tfmr(
+                inputs_embeds=current_speech_embed,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+            past_key_values = llm_outputs.past_key_values
+
+            # Get logits and sample
+            speech_logits = self.t3.speech_head(llm_outputs[0])
+            input_ids = generated_speech_tokens[:, :num_generated]
+            processed_logits = logits_processors(input_ids, speech_logits[:, -1, :])
+
+            if torch.all(processed_logits == -float("inf")):
+                break
+
+            probs = F.softmax(processed_logits, dim=-1)
+            next_speech_token = torch.multinomial(probs, num_samples=1)
+
+            if next_speech_token.item() == stop_token:
+                break
+
+            generated_speech_tokens[:, num_generated] = next_speech_token.squeeze()
+            num_generated += 1
+            yield next_speech_token
+
+            current_speech_token = next_speech_token
