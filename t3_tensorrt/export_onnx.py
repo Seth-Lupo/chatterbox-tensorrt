@@ -78,10 +78,6 @@ def export_to_onnx(output_path: Path, opset_version: int = 14):
     print("Exporting T3 Transformer to ONNX")
     print("=" * 60)
 
-    # Force legacy ONNX exporter (PyTorch 2.x uses dynamo by default)
-    import torch.onnx
-    torch.onnx.dynamo_export = None  # Disable dynamo export
-
     # Load T3 model
     print("\nLoading T3 model...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
@@ -111,9 +107,20 @@ def export_to_onnx(output_path: Path, opset_version: int = 14):
     print(f"  Input shape: {test_input.shape}")
     print(f"  Output shape: {test_output.shape}")
 
-    # Export to ONNX
+    # Export to ONNX using JIT trace (bypasses buggy dynamo exporter in PyTorch 2.x)
     print(f"\nExporting to ONNX: {output_path}")
     print(f"  Opset version: {opset_version}")
+    print("  Using torch.jit.trace (legacy method)")
+
+    # First, trace the model with JIT
+    print("  Tracing model with JIT...")
+    with torch.no_grad():
+        traced_model = torch.jit.trace(transformer, test_input)
+
+    # Verify traced model works
+    with torch.no_grad():
+        traced_output = traced_model(test_input)
+    print(f"  Traced model output shape: {traced_output.shape}")
 
     # Use dynamic axes for batch size and sequence length
     dynamic_axes = {
@@ -121,12 +128,12 @@ def export_to_onnx(output_path: Path, opset_version: int = 14):
         "hidden_states": {0: "batch_size", 1: "seq_len"},
     }
 
-    # Export using torch.onnx.export with explicit settings
-    # Use dynamo=False to avoid the new exporter which has issues
+    # Export traced model to ONNX (this uses the legacy exporter)
+    print("  Exporting traced model to ONNX...")
     with torch.no_grad():
         torch.onnx.export(
-            transformer,
-            (test_input,),  # Tuple of inputs
+            traced_model,
+            test_input,
             str(output_path),
             input_names=["inputs_embeds"],
             output_names=["hidden_states"],
