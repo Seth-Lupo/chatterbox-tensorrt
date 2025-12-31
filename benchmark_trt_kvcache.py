@@ -156,18 +156,19 @@ def test_kv_cache():
         return False, wrapper, model
 
 
-def benchmark_kv_cache_speedup():
+def benchmark_kv_cache_speedup(model=None):
     """Benchmark speedup from KV cache."""
     print("\n" + "="*60)
     print("Benchmarking KV Cache Speedup")
     print("="*60)
 
-    # Load model
-    model = ChatterboxTurboTTS.from_pretrained(
-        device="cuda",
-        dtype="float16",
-        compile_mode=None,
-    )
+    # Load model if not provided
+    if model is None:
+        model = ChatterboxTurboTTS.from_pretrained(
+            device="cuda",
+            dtype="float16",
+            compile_mode=None,
+        )
 
     wrapper = GPT2WithKVCache(model.t3.tfmr).cuda().half().eval()
     hidden_size = model.t3.cfg.hidden_size
@@ -316,8 +317,8 @@ def main():
         print("KV cache test failed, aborting")
         sys.exit(1)
 
-    # Benchmark KV cache speedup
-    wrapper, model = benchmark_kv_cache_speedup()
+    # Benchmark KV cache speedup (reuse the loaded model)
+    wrapper, model = benchmark_kv_cache_speedup(model)
 
     # Try TensorRT
     compiled = try_tensorrt_with_kvcache(wrapper, model)
