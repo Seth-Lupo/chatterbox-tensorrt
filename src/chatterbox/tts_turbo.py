@@ -38,8 +38,8 @@ def setup_cuda_optimizations():
     """Enable CUDA optimizations for faster inference."""
     if torch.cuda.is_available():
         # Enable TF32 for Ampere+ GPUs (including L4)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # Use new API (PyTorch 2.0+) to avoid deprecation warnings
+        torch.set_float32_matmul_precision('high')  # Enables TF32 for matmul
         # Enable cudnn autotuner
         torch.backends.cudnn.benchmark = True
         # Disable debug/profiling overhead
@@ -107,11 +107,13 @@ class Conditionals:
     t3: T3Cond
     gen: dict
 
-    def to(self, device):
-        self.t3 = self.t3.to(device=device)
+    def to(self, device=None, dtype=None):
+        self.t3 = self.t3.to(device=device, dtype=dtype)
         for k, v in self.gen.items():
             if torch.is_tensor(v):
-                self.gen[k] = v.to(device=device)
+                # Only convert floating point tensors to new dtype
+                is_fp = v.is_floating_point()
+                self.gen[k] = v.to(device=device, dtype=dtype if is_fp else None)
         return self
 
     def save(self, fpath: Path):
@@ -229,6 +231,8 @@ class ChatterboxTurboTTS:
         self.dtype = torch.float16
         self.t3 = self.t3.half()
         self.s3gen = self.s3gen.half()
+        if self.conds is not None:
+            self.conds = self.conds.to(dtype=torch.float16)
         logger.info("Models converted to float16")
         return self
 
@@ -237,6 +241,8 @@ class ChatterboxTurboTTS:
         self.dtype = torch.bfloat16
         self.t3 = self.t3.to(torch.bfloat16)
         self.s3gen = self.s3gen.to(torch.bfloat16)
+        if self.conds is not None:
+            self.conds = self.conds.to(dtype=torch.bfloat16)
         logger.info("Models converted to bfloat16")
         return self
 
@@ -315,7 +321,7 @@ class ChatterboxTurboTTS:
         conds = None
         builtin_voice = ckpt_dir / "conds.pt"
         if builtin_voice.exists():
-            conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
+            conds = Conditionals.load(builtin_voice, map_location=map_location).to(device=device, dtype=torch_dtype)
 
         instance = cls(t3, s3gen, ve, tokenizer, device, conds=conds, dtype=torch_dtype)
 
@@ -398,8 +404,8 @@ class ChatterboxTurboTTS:
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
-        ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        ).to(device=self.device, dtype=self.dtype)
+        self.conds = Conditionals(t3_cond, s3gen_ref_dict).to(device=self.device, dtype=self.dtype)
 
     def generate(
         self,
