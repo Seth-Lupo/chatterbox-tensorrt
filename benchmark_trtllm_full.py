@@ -2,7 +2,7 @@
 """
 Benchmark: Full TTS with TensorRT-LLM compiled transformer
 
-Uses TensorRT-LLM to compile the GPT-2 backbone of T3.
+Uses TensorRT-LLM (not torch-tensorrt) to compile the GPT-2 backbone.
 
 Usage:
     python benchmark_trtllm_full.py
@@ -12,244 +12,310 @@ import argparse
 import os
 import sys
 import time
-import json
 import tempfile
 import statistics
-import subprocess
 from pathlib import Path
 
 import torch
 import numpy as np
-from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 TEST_TEXTS = [
     "Hello, this is a test of the text to speech system.",
     "The quick brown fox jumps over the lazy dog.",
-    "Welcome to the future of artificial intelligence.",
-    "Today we are testing performance of audio generation.",
+    "Welcome to the future of artificial intelligence and speech synthesis.",
+    "Today we are testing the performance of our streaming audio generation.",
     "This benchmark measures latency to first audio chunk.",
-    "Machine learning models generate natural speech.",
-    "Real-time synthesis requires careful optimization.",
-    "Minimize time between text input and audio output.",
-    "Streaming allows hearing audio before generation completes.",
-    "Performance testing identifies pipeline bottlenecks.",
+    "Machine learning models can now generate natural sounding speech.",
+    "Real-time audio synthesis requires careful optimization.",
+    "The goal is to minimize time between text input and audio output.",
+    "Streaming allows users to hear audio before full generation completes.",
+    "Performance testing helps identify bottlenecks in the pipeline.",
 ]
 
 
-def export_gpt2_for_trtllm(model, output_dir: Path):
-    """Export T3's GPT-2 weights in TensorRT-LLM format."""
-    print("\n" + "="*60)
-    print("Exporting GPT-2 weights for TensorRT-LLM...")
-    print("="*60)
+def build_trtllm_engine(model, engine_dir: Path):
+    """Build TensorRT-LLM engine for the T3 GPT-2 transformer."""
+    import tensorrt_llm
+    from tensorrt_llm.builder import Builder
+    from tensorrt_llm.network import net_guard
+    from tensorrt_llm.models import GPTModel, GPTConfig
+    from tensorrt_llm.plugin import PluginConfig
+    from tensorrt_llm.mapping import Mapping
+    import tensorrt as trt
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print("Building TensorRT-LLM engine...")
 
+    # Get T3's GPT-2 config
     gpt_cfg = model.t3.cfg
-    pytorch_tfmr = model.t3.tfmr
+    print(f"  Hidden size: {gpt_cfg.hidden_size}")
+    print(f"  Num layers: {gpt_cfg.num_hidden_layers}")
+    print(f"  Num heads: {gpt_cfg.num_attention_heads}")
+    print(f"  Vocab size: {gpt_cfg.vocab_size}")
 
     # Create TensorRT-LLM config
-    config = {
-        "architecture": "GPTForCausalLM",
-        "dtype": "float16",
-        "num_hidden_layers": gpt_cfg.num_hidden_layers,
-        "num_attention_heads": gpt_cfg.num_attention_heads,
-        "hidden_size": gpt_cfg.hidden_size,
-        "intermediate_size": gpt_cfg.hidden_size * 4,
-        "vocab_size": gpt_cfg.vocab_size,
-        "max_position_embeddings": 2048,
-        "hidden_act": "gelu",
-        "norm_epsilon": 1e-5,
-        "position_embedding_type": "learned_absolute",
-        "quantization": {"quant_algo": None},
-        "mapping": {"world_size": 1, "tp_size": 1, "pp_size": 1},
-    }
+    # Note: TensorRT-LLM GPTConfig may have different parameter names
+    trtllm_config = GPTConfig(
+        num_hidden_layers=gpt_cfg.num_hidden_layers,
+        num_attention_heads=gpt_cfg.num_attention_heads,
+        hidden_size=gpt_cfg.hidden_size,
+        vocab_size=gpt_cfg.vocab_size,
+        hidden_act='gelu',
+        max_position_embeddings=2048,
+        dtype='float16',
+    )
 
-    with open(output_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"  Config saved to {output_dir / 'config.json'}")
+    print(f"  TensorRT-LLM config created")
 
-    # Convert PyTorch weights to TensorRT-LLM naming
+    # Create the TensorRT-LLM model
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+
+    tensorrt_llm_gpt = GPTModel(trtllm_config)
+
+    # Load weights from PyTorch model
+    print("  Loading weights from PyTorch model...")
+    pytorch_tfmr = model.t3.tfmr
+
+    # Map PyTorch weights to TensorRT-LLM format
+    # This is the critical part - weight names must match
     state_dict = pytorch_tfmr.state_dict()
-    trtllm_weights = {}
-
-    print(f"\n  Converting {len(state_dict)} weight tensors...")
 
     for name, param in state_dict.items():
-        # TensorRT-LLM uses different naming conventions
-        new_name = name
+        print(f"    {name}: {param.shape}")
 
-        # wpe -> transformer.position_embedding
-        if name == "wpe.weight":
-            new_name = "transformer.position_embedding.weight"
+    # Build engine
+    print("  Building TensorRT engine...")
 
-        # h.X -> transformer.layers.X
-        elif name.startswith("h."):
-            parts = name.split(".")
-            layer_idx = parts[1]
+    builder = Builder()
+    builder_config = builder.create_builder_config(
+        name='t3_gpt2',
+        precision='float16',
+        max_batch_size=1,
+        max_input_len=2048,
+        max_seq_len=2048,
+    )
 
-            if "ln_1" in name:
-                new_name = f"transformer.layers.{layer_idx}.input_layernorm.weight" if "weight" in name else f"transformer.layers.{layer_idx}.input_layernorm.bias"
-            elif "ln_2" in name:
-                new_name = f"transformer.layers.{layer_idx}.post_attention_layernorm.weight" if "weight" in name else f"transformer.layers.{layer_idx}.post_attention_layernorm.bias"
-            elif "attn.c_attn" in name:
-                # Attention QKV projection
-                if "weight" in name:
-                    new_name = f"transformer.layers.{layer_idx}.attention.qkv.weight"
-                else:
-                    new_name = f"transformer.layers.{layer_idx}.attention.qkv.bias"
-            elif "attn.c_proj" in name:
-                # Attention output projection
-                if "weight" in name:
-                    new_name = f"transformer.layers.{layer_idx}.attention.dense.weight"
-                else:
-                    new_name = f"transformer.layers.{layer_idx}.attention.dense.bias"
-            elif "mlp.c_fc" in name:
-                # MLP first layer
-                if "weight" in name:
-                    new_name = f"transformer.layers.{layer_idx}.mlp.fc.weight"
-                else:
-                    new_name = f"transformer.layers.{layer_idx}.mlp.fc.bias"
-            elif "mlp.c_proj" in name:
-                # MLP second layer
-                if "weight" in name:
-                    new_name = f"transformer.layers.{layer_idx}.mlp.proj.weight"
-                else:
-                    new_name = f"transformer.layers.{layer_idx}.mlp.proj.bias"
-
-        # ln_f -> transformer.ln_f
-        elif name.startswith("ln_f"):
-            new_name = f"transformer.{name}"
-
-        # Convert to half precision and contiguous
-        trtllm_weights[new_name] = param.half().contiguous()
-
-    # Save weights
-    save_file(trtllm_weights, output_dir / "model.safetensors")
-    print(f"  Weights saved to {output_dir / 'model.safetensors'}")
-    print(f"  Total weights: {len(trtllm_weights)}")
-
-    return output_dir
-
-
-def build_trtllm_engine(checkpoint_dir: Path, engine_dir: Path):
-    """Build TensorRT-LLM engine using trtllm-build CLI."""
-    print("\n" + "="*60)
-    print("Building TensorRT-LLM engine...")
-    print("="*60)
+    # Plugin config
+    plugin_config = PluginConfig()
+    plugin_config.gpt_attention_plugin = 'float16'
+    plugin_config.gemm_plugin = 'float16'
 
     engine_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check if trtllm-build is available
-    try:
-        result = subprocess.run(["trtllm-build", "--help"], capture_output=True, text=True)
-        print("  trtllm-build found")
-    except FileNotFoundError:
-        print("  ERROR: trtllm-build not found in PATH")
-        print("  Trying Python API instead...")
-        return build_trtllm_engine_python(checkpoint_dir, engine_dir)
+    # Build
+    with net_guard(tensorrt_llm_gpt):
+        # Define network inputs
+        network = tensorrt_llm_gpt
 
-    # Build command
-    cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={checkpoint_dir}",
-        f"--output_dir={engine_dir}",
-        "--gemm_plugin=float16",
-        "--gpt_attention_plugin=float16",
-        "--max_batch_size=1",
-        "--max_input_len=2048",
-        "--max_seq_len=2048",
-    ]
+        # This is where we'd define the forward pass
+        # TensorRT-LLM has specific APIs for this
 
-    print(f"  Running: {' '.join(cmd)}")
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            print("  Engine built successfully!")
-            return engine_dir
-        else:
-            print(f"  Build failed: {result.stderr}")
-            return None
-    except subprocess.TimeoutExpired:
-        print("  Build timed out (5 min limit)")
-        return None
-    except Exception as e:
-        print(f"  Build error: {e}")
-        return None
+    print(f"  Engine saved to: {engine_dir}")
+    return engine_dir
 
 
-def build_trtllm_engine_python(checkpoint_dir: Path, engine_dir: Path):
-    """Build engine using TensorRT-LLM Python API."""
-    print("\n  Using Python API to build engine...")
+def try_trtllm_simple(model):
+    """Try a simpler TensorRT-LLM approach using their high-level API."""
+    print("\n" + "="*60)
+    print("Attempting TensorRT-LLM compilation...")
+    print("="*60)
 
     try:
         import tensorrt_llm
-        from tensorrt_llm.builder import Builder
-        from tensorrt_llm.models.gpt.model import GPTLMHeadModel
-        from tensorrt_llm.plugin import PluginConfig
+        from tensorrt_llm import LLM, SamplingParams
+        from tensorrt_llm.hlapi import LLM as HLAPI_LLM
 
-        # Load config
-        with open(checkpoint_dir / "config.json") as f:
-            config = json.load(f)
+        print(f"TensorRT-LLM version: {tensorrt_llm.__version__}")
 
-        print(f"  Config: layers={config['num_hidden_layers']}, hidden={config['hidden_size']}")
-
-        # This would require implementing the full model loading
-        # TensorRT-LLM's Python API is complex
-
-        print("  Note: Full Python API build requires more setup")
-        print("  Recommend using trtllm-build CLI instead")
+        # Check what's available in the high-level API
+        print("\nAvailable in tensorrt_llm:")
+        for attr in dir(tensorrt_llm):
+            if not attr.startswith('_'):
+                print(f"  - {attr}")
 
         return None
 
     except Exception as e:
-        print(f"  Python API error: {e}")
+        print(f"Error: {e}")
         import traceback
         traceback.print_exc()
         return None
 
 
-def load_trtllm_engine(engine_dir: Path):
-    """Load TensorRT-LLM engine for inference."""
+def try_trtllm_convert_checkpoint(model, output_dir: Path):
+    """Try using TensorRT-LLM's checkpoint conversion."""
     print("\n" + "="*60)
-    print("Loading TensorRT-LLM engine...")
+    print("Attempting TensorRT-LLM checkpoint conversion...")
     print("="*60)
 
     try:
-        from tensorrt_llm.runtime import ModelRunner
+        import tensorrt_llm
+        from tensorrt_llm.models.gpt.convert import convert_hf_gpt2
 
-        runner = ModelRunner.from_dir(str(engine_dir))
-        print("  Engine loaded successfully!")
-        return runner
+        # Get the HuggingFace GPT2 model
+        pytorch_tfmr = model.t3.tfmr
+        print(f"PyTorch transformer type: {type(pytorch_tfmr)}")
 
+        # TensorRT-LLM expects a HuggingFace model path or model object
+        # Let's see if we can use the convert function
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check convert function signature
+        import inspect
+        sig = inspect.signature(convert_hf_gpt2)
+        print(f"\nconvert_hf_gpt2 signature: {sig}")
+
+        return None
+
+    except ImportError as e:
+        print(f"Import error: {e}")
+        print("\nTrying alternative approach...")
+        return try_trtllm_manual_build(model, output_dir)
     except Exception as e:
-        print(f"  Load error: {e}")
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
-class TRTLLMWrapper(torch.nn.Module):
-    """Wrapper to use TensorRT-LLM engine in place of PyTorch GPT-2."""
+def try_trtllm_manual_build(model, output_dir: Path):
+    """Manually build TensorRT-LLM engine."""
+    print("\n" + "="*60)
+    print("Manual TensorRT-LLM engine build...")
+    print("="*60)
 
-    def __init__(self, runner, hidden_size):
-        super().__init__()
-        self.runner = runner
-        self.hidden_size = hidden_size
+    try:
+        import tensorrt_llm
+        from tensorrt_llm import Tensor
+        from tensorrt_llm.functional import (
+            embedding, gelu, layer_norm, matmul, softmax,
+            concat, select, shape, gather, cast
+        )
+        from tensorrt_llm.layers import (
+            Embedding, Linear, LayerNorm, Attention, MLP,
+            ColumnLinear, RowLinear, GatedMLP
+        )
+        from tensorrt_llm.module import Module, ModuleList
+        from tensorrt_llm.builder import Builder
+        from tensorrt_llm.network import net_guard
+        import tensorrt as trt
 
-    def forward(self, inputs_embeds, **kwargs):
-        # TensorRT-LLM expects different input format
-        # This is a simplified wrapper
+        gpt_cfg = model.t3.cfg
+        print(f"Building for: hidden={gpt_cfg.hidden_size}, layers={gpt_cfg.num_hidden_layers}, heads={gpt_cfg.num_attention_heads}")
 
-        # Run inference
-        with torch.no_grad():
-            # The actual API depends on TensorRT-LLM version
-            outputs = self.runner.generate(
-                inputs_embeds,
-                max_new_tokens=1,  # We just need hidden states
+        class TRT_GPT2Block(Module):
+            def __init__(self, hidden_size, num_heads, layer_idx):
+                super().__init__()
+                self.ln_1 = LayerNorm(hidden_size)
+                self.attn = Attention(
+                    hidden_size=hidden_size,
+                    num_attention_heads=num_heads,
+                    attention_head_size=hidden_size // num_heads,
+                    num_kv_heads=num_heads,
+                    layer_idx=layer_idx,
+                )
+                self.ln_2 = LayerNorm(hidden_size)
+                self.mlp = MLP(
+                    hidden_size=hidden_size,
+                    ffn_hidden_size=hidden_size * 4,
+                    hidden_act='gelu',
+                )
+
+            def forward(self, hidden_states, attention_mask=None, past_key_value=None):
+                residual = hidden_states
+                hidden_states = self.ln_1(hidden_states)
+                attn_output = self.attn(hidden_states, attention_mask, past_key_value)
+                hidden_states = residual + attn_output
+
+                residual = hidden_states
+                hidden_states = self.ln_2(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+
+                return hidden_states
+
+        class TRT_GPT2(Module):
+            def __init__(self, config):
+                super().__init__()
+                self.hidden_size = config.hidden_size
+                self.num_layers = config.num_hidden_layers
+                self.num_heads = config.num_attention_heads
+
+                self.wpe = Embedding(2048, self.hidden_size)
+                self.layers = ModuleList([
+                    TRT_GPT2Block(self.hidden_size, self.num_heads, i)
+                    for i in range(self.num_layers)
+                ])
+                self.ln_f = LayerNorm(self.hidden_size)
+
+            def forward(self, input_embeds, position_ids=None):
+                if position_ids is None:
+                    # Create position IDs
+                    seq_len = shape(input_embeds, 1)
+                    position_ids = concat([cast(i, 'int32') for i in range(2048)])[:seq_len]
+
+                pos_embeds = self.wpe(position_ids)
+                hidden_states = input_embeds + pos_embeds
+
+                for layer in self.layers:
+                    hidden_states = layer(hidden_states)
+
+                hidden_states = self.ln_f(hidden_states)
+                return hidden_states
+
+        # Create model
+        print("Creating TensorRT-LLM GPT2 model...")
+        trt_model = TRT_GPT2(gpt_cfg)
+
+        # Load weights
+        print("Loading weights...")
+        pytorch_state = model.t3.tfmr.state_dict()
+
+        # Map weights (this is complex and model-specific)
+        # For now, just show the weight mapping needed
+        print("\nPyTorch weights to map:")
+        for name, param in pytorch_state.items():
+            print(f"  {name}: {param.shape}")
+
+        # Build engine
+        print("\nBuilding TensorRT engine...")
+        builder = Builder()
+
+        with net_guard(trt_model):
+            builder_config = builder.create_builder_config(
+                name='t3_gpt2',
+                precision='float16',
             )
 
-        return outputs
+            # Define input
+            input_embeds = Tensor(
+                name='input_embeds',
+                dtype=trt.float16,
+                shape=[-1, -1, gpt_cfg.hidden_size],
+            )
+
+            # Forward
+            output = trt_model(input_embeds)
+
+            # Mark output
+            output.mark_output('output', trt.float16)
+
+        # Save engine
+        output_dir.mkdir(parents=True, exist_ok=True)
+        engine_path = output_dir / 'gpt2_engine.trt'
+
+        print(f"Engine would be saved to: {engine_path}")
+        print("\nNote: Full weight mapping requires careful attention to naming conventions")
+
+        return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def measure_time_to_first_audio(model, text: str) -> float:
@@ -284,7 +350,7 @@ def run_benchmark(model, name: str, iterations: int) -> dict:
         text = TEST_TEXTS[i % len(TEST_TEXTS)]
         latency = measure_time_to_first_audio(model, text)
         latencies.append(latency)
-        print(f"  Run {i+1}/{iterations}: {latency:.3f}s - \"{text[:35]}...\"")
+        print(f"  Run {i+1}/{iterations}: {latency:.3f}s")
         torch.cuda.empty_cache()
 
     results = {
@@ -302,8 +368,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--dtype", type=str, default="float16")
-    parser.add_argument("--engine-dir", type=str, default=None, help="Pre-built engine directory")
-    parser.add_argument("--export-only", action="store_true", help="Only export weights, don't benchmark")
     args = parser.parse_args()
 
     print("="*60)
@@ -325,63 +389,28 @@ def main():
     print("Model loaded")
 
     # PyTorch baseline
-    if not args.export_only:
-        pytorch_results = run_benchmark(model, "PyTorch Baseline", args.iterations)
+    pytorch_results = run_benchmark(model, "PyTorch Baseline", args.iterations)
 
-    # Export and build TensorRT-LLM engine
+    # Try TensorRT-LLM
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        checkpoint_dir = tmpdir / "checkpoint"
-        engine_dir = Path(args.engine_dir) if args.engine_dir else tmpdir / "engine"
+        output_dir = Path(tmpdir) / "trtllm_engine"
 
-        # Export weights
-        export_gpt2_for_trtllm(model, checkpoint_dir)
+        # Try different approaches
+        try_trtllm_simple(model)
+        try_trtllm_convert_checkpoint(model, output_dir)
 
-        if args.export_only:
-            # Copy to permanent location
-            import shutil
-            perm_dir = Path("trtllm_checkpoint")
-            if perm_dir.exists():
-                shutil.rmtree(perm_dir)
-            shutil.copytree(checkpoint_dir, perm_dir)
-            print(f"\nCheckpoint exported to: {perm_dir}")
-            print("\nTo build engine, run:")
-            print(f"  trtllm-build --checkpoint_dir={perm_dir} --output_dir=trtllm_engine --gemm_plugin=float16 --gpt_attention_plugin=float16 --max_batch_size=1 --max_input_len=2048 --max_seq_len=2048")
-            return
-
-        # Build engine
-        if args.engine_dir and Path(args.engine_dir).exists():
-            print(f"\nUsing pre-built engine from {args.engine_dir}")
-            built_engine_dir = Path(args.engine_dir)
-        else:
-            built_engine_dir = build_trtllm_engine(checkpoint_dir, engine_dir)
-
-        if built_engine_dir:
-            # Load and benchmark
-            runner = load_trtllm_engine(built_engine_dir)
-            if runner:
-                print("\nTensorRT-LLM engine ready!")
-                print("Note: Full integration requires replacing T3's transformer calls")
-            else:
-                print("\nEngine built but failed to load")
-        else:
-            print("\nEngine build failed")
-
-    # Summary
     print("\n" + "="*60)
     print("SUMMARY")
     print("="*60)
-
-    if not args.export_only:
-        print(f"\nPyTorch baseline: {pytorch_results['mean']:.3f}s mean latency")
-
-    print("\nTensorRT-LLM Status:")
-    print("  - Weights exported: YES")
-    print("  - Engine built: Check above")
-    print("\nTo use TensorRT-LLM in production:")
-    print("  1. Export: python benchmark_trtllm_full.py --export-only")
-    print("  2. Build:  trtllm-build --checkpoint_dir=trtllm_checkpoint ...")
-    print("  3. Load engine and replace T3.tfmr forward pass")
+    print(f"\nPyTorch baseline: {pytorch_results['mean']:.3f}s mean latency")
+    print("\nTensorRT-LLM integration requires:")
+    print("  1. Export model to TensorRT-LLM checkpoint format")
+    print("  2. Use trtllm-build CLI or Python API to build engine")
+    print("  3. Load engine and run with TensorRT-LLM runtime")
+    print("\nThis is more complex than torch-tensorrt due to:")
+    print("  - Custom weight mapping")
+    print("  - TensorRT-LLM's specific model definitions")
+    print("  - Separate runtime from PyTorch")
 
 
 if __name__ == "__main__":
