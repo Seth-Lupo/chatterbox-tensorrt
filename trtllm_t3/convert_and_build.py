@@ -179,27 +179,42 @@ def convert_hf_to_trtllm():
                 trtllm_weights[f"{layer_prefix}.mlp.proj.bias"] = weight
                 print(f"  {name} -> {layer_prefix}.mlp.proj.bias")
 
-    # Save as .npy files (TensorRT-LLM 1.x format)
+    # Save as safetensors (TensorRT-LLM format)
     print(f"\nSaving to {TRTLLM_CHECKPOINT}...")
-    for name, weight in trtllm_weights.items():
-        # Convert to float16
-        weight_fp16 = weight.astype(np.float16)
-        filename = name.replace(".", "_") + ".npy"
-        np.save(TRTLLM_CHECKPOINT / filename, weight_fp16)
 
-    # Save config for TensorRT-LLM
+    # Convert all weights to torch tensors in float16
+    torch_weights = {}
+    for name, weight in trtllm_weights.items():
+        torch_weights[name] = torch.from_numpy(weight.astype(np.float16))
+
+    # Save as safetensors
+    try:
+        from safetensors.torch import save_file
+        save_file(torch_weights, TRTLLM_CHECKPOINT / "rank0.safetensors")
+        print(f"  Saved rank0.safetensors")
+    except ImportError:
+        # Fallback to PyTorch format
+        torch.save(torch_weights, TRTLLM_CHECKPOINT / "rank0.bin")
+        print(f"  Saved rank0.bin (safetensors not available)")
+
+    # Save config for TensorRT-LLM (must match expected schema)
     trtllm_config = {
         "architecture": "GPTForCausalLM",
         "dtype": "float16",
         "num_hidden_layers": num_layers,
         "num_attention_heads": num_heads,
+        "num_key_value_heads": num_heads,  # GPT-2 uses MHA, not GQA
         "hidden_size": hidden_size,
-        "intermediate_size": hf_config.get("n_inner", hidden_size * 4),
+        "intermediate_size": hf_config.get("n_inner") or hidden_size * 4,
         "vocab_size": hf_config["vocab_size"],
         "position_embedding_type": "learned_absolute",
         "max_position_embeddings": hf_config.get("n_positions", 2048),
         "hidden_act": "gelu",
-        "quantization": {"quant_algo": None},
+        "norm_epsilon": 1e-5,
+        "quantization": {
+            "quant_algo": None,
+            "kv_cache_quant_algo": None,
+        },
         "mapping": {
             "world_size": 1,
             "tp_size": 1,
