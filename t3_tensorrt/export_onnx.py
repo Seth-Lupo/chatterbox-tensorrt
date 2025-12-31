@@ -107,20 +107,12 @@ def export_to_onnx(output_path: Path, opset_version: int = 14):
     print(f"  Input shape: {test_input.shape}")
     print(f"  Output shape: {test_output.shape}")
 
-    # Export to ONNX using JIT trace (bypasses buggy dynamo exporter in PyTorch 2.x)
+    # Export to ONNX
     print(f"\nExporting to ONNX: {output_path}")
     print(f"  Opset version: {opset_version}")
-    print("  Using torch.jit.trace (legacy method)")
 
-    # First, trace the model with JIT
-    print("  Tracing model with JIT...")
-    with torch.no_grad():
-        traced_model = torch.jit.trace(transformer, test_input)
-
-    # Verify traced model works
-    with torch.no_grad():
-        traced_output = traced_model(test_input)
-    print(f"  Traced model output shape: {traced_output.shape}")
+    # Ensure eval mode (disables dropout)
+    transformer.eval()
 
     # Use dynamic axes for batch size and sequence length
     dynamic_axes = {
@@ -128,11 +120,11 @@ def export_to_onnx(output_path: Path, opset_version: int = 14):
         "hidden_states": {0: "batch_size", 1: "seq_len"},
     }
 
-    # Export traced model to ONNX (this uses the legacy exporter)
-    print("  Exporting traced model to ONNX...")
+    # Export to ONNX with legacy exporter (dynamo=False)
+    print("  Exporting with legacy exporter (dynamo=False)...")
     with torch.no_grad():
         torch.onnx.export(
-            traced_model,
+            transformer,
             test_input,
             str(output_path),
             input_names=["inputs_embeds"],
@@ -142,6 +134,7 @@ def export_to_onnx(output_path: Path, opset_version: int = 14):
             do_constant_folding=True,
             export_params=True,
             verbose=False,
+            dynamo=False,  # Force legacy exporter
         )
 
     file_size_mb = output_path.stat().st_size / (1024*1024)
