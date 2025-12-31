@@ -164,6 +164,7 @@ class ChatterboxTurboTTS:
         self.conds = conds
         self.dtype = dtype
         self._compiled = False
+        self._quantized = False
 
         # Pre-create logits processors (avoid recreating each call)
         self._logits_processors_cache = {}
@@ -257,6 +258,32 @@ class ChatterboxTurboTTS:
         logger.info("Models converted to bfloat16")
         return self
 
+    def to_int8(self):
+        """
+        Quantize models to int8 for faster inference and lower memory.
+        Uses dynamic quantization on linear layers.
+        Note: Requires CPU or CUDA with int8 support.
+        """
+        # Dynamic quantization - quantizes weights to int8, activations computed in fp32
+        # This is the simplest form and doesn't require calibration data
+        self.t3.tfmr = torch.ao.quantization.quantize_dynamic(
+            self.t3.tfmr,
+            {torch.nn.Linear},
+            dtype=torch.qint8
+        )
+        # Quantize speech head
+        self.t3.speech_head = torch.ao.quantization.quantize_dynamic(
+            self.t3.speech_head,
+            {torch.nn.Linear},
+            dtype=torch.qint8
+        )
+        # Note: Embeddings and S3Gen flow are kept in fp16 for quality
+        # S3Gen uses conv layers which don't benefit as much from int8
+        self.dtype = torch.float16  # Activations still in fp16
+        self._quantized = True
+        logger.info("T3 transformer quantized to int8 (dynamic quantization)")
+        return self
+
     @classmethod
     def from_local(
         cls,
@@ -271,7 +298,7 @@ class ChatterboxTurboTTS:
         Args:
             ckpt_dir: Path to checkpoint directory
             device: Device to load model on ("cuda", "cpu", "mps")
-            dtype: Data type ("float32", "float16", "bfloat16")
+            dtype: Data type ("float32", "float16", "bfloat16", "int8")
             compile_mode: Compilation mode (None, "default", "reduce-overhead", "max-autotune", "tensorrt")
         """
         ckpt_dir = Path(ckpt_dir)
@@ -286,12 +313,16 @@ class ChatterboxTurboTTS:
         else:
             map_location = None
 
+        # For int8, load as float16 first then quantize
+        use_int8 = dtype == "int8"
+        load_dtype = "float16" if use_int8 else dtype
+
         # Determine torch dtype
         torch_dtype = {
             "float32": torch.float32,
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
-        }.get(dtype, torch.float32)
+        }.get(load_dtype, torch.float32)
 
         ve = VoiceEncoder()
         ve.load_state_dict(
@@ -336,7 +367,11 @@ class ChatterboxTurboTTS:
 
         instance = cls(t3, s3gen, ve, tokenizer, device, conds=conds, dtype=torch_dtype)
 
-        # Compile if requested
+        # Apply int8 quantization if requested
+        if use_int8:
+            instance.to_int8()
+
+        # Compile if requested (after quantization)
         if compile_mode:
             instance.compile_models(compile_mode)
 
@@ -358,6 +393,7 @@ class ChatterboxTurboTTS:
                 - "float32": Full precision (default, most accurate)
                 - "float16": Half precision (faster, slight quality loss)
                 - "bfloat16": Brain float16 (faster, better precision than fp16)
+                - "int8": 8-bit quantization (fastest, some quality loss)
             compile_mode: Optional compilation for faster inference
                 - None: No compilation (default)
                 - "default": Basic torch.compile
@@ -366,11 +402,11 @@ class ChatterboxTurboTTS:
                 - "tensorrt": Use TensorRT (requires torch-tensorrt)
 
         Example:
-            # Fast inference on GPU with compilation
+            # Fast inference on GPU with int8 quantization
             model = ChatterboxTurboTTS.from_pretrained(
                 device="cuda",
-                dtype="float16",
-                compile_mode="reduce-overhead"
+                dtype="int8",
+                compile_mode="default"
             )
         """
         # Check if MPS is available on macOS

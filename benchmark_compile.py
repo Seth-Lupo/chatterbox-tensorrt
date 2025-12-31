@@ -105,10 +105,14 @@ def main():
     parser.add_argument("--compile_mode", type=str, default="tensorrt",
                         choices=["tensorrt", "default", "max-autotune"],
                         help="Compilation mode")
+    parser.add_argument("--dtype", type=str, default="float16",
+                        choices=["float16", "int8", "bfloat16"],
+                        help="Data type (float16, int8, bfloat16)")
     args = parser.parse_args()
 
+    dtype_label = args.dtype.upper()
     print("="*60)
-    print("Chatterbox Turbo - Optimized Benchmark (FP16)")
+    print(f"Chatterbox Turbo - Optimized Benchmark ({dtype_label})")
     print("="*60)
 
     # GPU info
@@ -124,7 +128,7 @@ def main():
         print("ERROR: CUDA not available")
         sys.exit(1)
 
-    print(f"Dtype: float16")
+    print(f"Dtype: {args.dtype}")
     print(f"Compile mode: {args.compile_mode}")
     print(f"Iterations: {args.iterations}")
     print(f"Audio prompt: {args.audio_prompt or 'None (using default voice)'}")
@@ -133,13 +137,13 @@ def main():
     # Load optimized model
     # =========================================================================
     print("\n" + "="*60)
-    print(f"Loading model with fp16 + torch.compile({args.compile_mode})...")
+    print(f"Loading model with {dtype_label} + torch.compile({args.compile_mode})...")
     print("="*60)
 
     load_start = time.perf_counter()
     model = ChatterboxTurboTTS.from_pretrained(
         device="cuda",
-        dtype="float16",
+        dtype=args.dtype,
         compile_mode=args.compile_mode,
     )
     load_time = time.perf_counter() - load_start
@@ -148,7 +152,7 @@ def main():
     # Run benchmark
     results = run_benchmark(
         model,
-        f"FP16 + torch.compile({args.compile_mode})",
+        f"{dtype_label} + torch.compile({args.compile_mode})",
         args.iterations,
         args.audio_prompt
     )
@@ -160,7 +164,7 @@ def main():
     print("BENCHMARK RESULTS")
     print("="*60)
 
-    print(f"\nConfiguration: FP16 + torch.compile({args.compile_mode})")
+    print(f"\nConfiguration: {dtype_label} + torch.compile({args.compile_mode})")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("-"*60)
     print(f"  Mean latency:   {results['mean']:.3f}s")
