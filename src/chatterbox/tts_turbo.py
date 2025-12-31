@@ -164,7 +164,6 @@ class ChatterboxTurboTTS:
         self.conds = conds
         self.dtype = dtype
         self._compiled = False
-        self._quantized = False
 
         # Pre-create logits processors (avoid recreating each call)
         self._logits_processors_cache = {}
@@ -203,11 +202,11 @@ class ChatterboxTurboTTS:
                     truncate_long_and_double=True,
                 )
                 logger.info("S3Gen flow compiled with TensorRT")
-                # Use default torch.compile for T3 with dynamic=True for varying sequence lengths
-                self.t3.tfmr = torch.compile(self.t3.tfmr, dynamic=True)
-                self.t3.speech_emb = torch.compile(self.t3.speech_emb, dynamic=True)
-                self.t3.speech_head = torch.compile(self.t3.speech_head, dynamic=True)
-                logger.info("T3 compiled with torch.compile (dynamic=True)")
+                # Use default torch.compile for T3 (CUDA graphs don't work with autoregressive)
+                self.t3.tfmr = torch.compile(self.t3.tfmr)
+                self.t3.speech_emb = torch.compile(self.t3.speech_emb)
+                self.t3.speech_head = torch.compile(self.t3.speech_head)
+                logger.info("T3 compiled with torch.compile (default mode)")
             except ImportError:
                 logger.warning("torch-tensorrt not installed, falling back to torch.compile")
                 mode = "default"
@@ -219,13 +218,13 @@ class ChatterboxTurboTTS:
             # NOTE: "reduce-overhead" uses CUDA graphs which don't work with
             # autoregressive generation (dynamic shapes, tensor reuse issues).
             # Use "default" mode for streaming/autoregressive workloads.
-            compile_kwargs = {"dynamic": True}  # Handle varying input sizes without recompilation
+            compile_kwargs = {}
             if mode == "reduce-overhead":
                 logger.warning("reduce-overhead mode may cause issues with streaming generation")
-                compile_kwargs["mode"] = "reduce-overhead"
+                compile_kwargs = {"mode": "reduce-overhead"}
             elif mode == "max-autotune":
-                compile_kwargs["mode"] = "max-autotune"
-            # "default" mode uses no special options (just dynamic=True)
+                compile_kwargs = {"mode": "max-autotune"}
+            # "default" mode uses no special options
 
             # Compile T3 transformer
             self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
@@ -234,7 +233,7 @@ class ChatterboxTurboTTS:
             self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
             # Compile S3Gen flow model
             self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'}, dynamic=True)")
+            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'})")
 
         self._compiled = True
 
@@ -258,32 +257,6 @@ class ChatterboxTurboTTS:
         logger.info("Models converted to bfloat16")
         return self
 
-    def to_int8(self):
-        """
-        Quantize models to int8 for faster inference and lower memory.
-        Uses dynamic quantization on linear layers.
-        Note: Requires CPU or CUDA with int8 support.
-        """
-        # Dynamic quantization - quantizes weights to int8, activations computed in fp32
-        # This is the simplest form and doesn't require calibration data
-        self.t3.tfmr = torch.ao.quantization.quantize_dynamic(
-            self.t3.tfmr,
-            {torch.nn.Linear},
-            dtype=torch.qint8
-        )
-        # Quantize speech head
-        self.t3.speech_head = torch.ao.quantization.quantize_dynamic(
-            self.t3.speech_head,
-            {torch.nn.Linear},
-            dtype=torch.qint8
-        )
-        # Note: Embeddings and S3Gen flow are kept in fp16 for quality
-        # S3Gen uses conv layers which don't benefit as much from int8
-        self.dtype = torch.float16  # Activations still in fp16
-        self._quantized = True
-        logger.info("T3 transformer quantized to int8 (dynamic quantization)")
-        return self
-
     @classmethod
     def from_local(
         cls,
@@ -298,7 +271,7 @@ class ChatterboxTurboTTS:
         Args:
             ckpt_dir: Path to checkpoint directory
             device: Device to load model on ("cuda", "cpu", "mps")
-            dtype: Data type ("float32", "float16", "bfloat16", "int8")
+            dtype: Data type ("float32", "float16", "bfloat16")
             compile_mode: Compilation mode (None, "default", "reduce-overhead", "max-autotune", "tensorrt")
         """
         ckpt_dir = Path(ckpt_dir)
@@ -313,16 +286,12 @@ class ChatterboxTurboTTS:
         else:
             map_location = None
 
-        # For int8, load as float16 first then quantize
-        use_int8 = dtype == "int8"
-        load_dtype = "float16" if use_int8 else dtype
-
         # Determine torch dtype
         torch_dtype = {
             "float32": torch.float32,
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
-        }.get(load_dtype, torch.float32)
+        }.get(dtype, torch.float32)
 
         ve = VoiceEncoder()
         ve.load_state_dict(
@@ -367,11 +336,7 @@ class ChatterboxTurboTTS:
 
         instance = cls(t3, s3gen, ve, tokenizer, device, conds=conds, dtype=torch_dtype)
 
-        # Apply int8 quantization if requested
-        if use_int8:
-            instance.to_int8()
-
-        # Compile if requested (after quantization)
+        # Compile if requested
         if compile_mode:
             instance.compile_models(compile_mode)
 
@@ -393,7 +358,6 @@ class ChatterboxTurboTTS:
                 - "float32": Full precision (default, most accurate)
                 - "float16": Half precision (faster, slight quality loss)
                 - "bfloat16": Brain float16 (faster, better precision than fp16)
-                - "int8": 8-bit quantization (fastest, some quality loss)
             compile_mode: Optional compilation for faster inference
                 - None: No compilation (default)
                 - "default": Basic torch.compile
@@ -402,11 +366,11 @@ class ChatterboxTurboTTS:
                 - "tensorrt": Use TensorRT (requires torch-tensorrt)
 
         Example:
-            # Fast inference on GPU with int8 quantization
+            # Fast inference on GPU with compilation
             model = ChatterboxTurboTTS.from_pretrained(
                 device="cuda",
-                dtype="int8",
-                compile_mode="default"
+                dtype="float16",
+                compile_mode="reduce-overhead"
             )
         """
         # Check if MPS is available on macOS

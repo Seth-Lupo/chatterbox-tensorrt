@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Benchmark: Optimized Chatterbox Turbo with torch.compile
+Benchmark: CUDA vs torch.compile with TensorRT backend
 
-Tests time-to-first-audio latency with fp16 and torch.compile optimization.
+Compares time-to-first-audio for:
+1. Plain CUDA (no compilation)
+2. torch.compile with TensorRT backend
 
 Usage:
     python benchmark_compile.py
@@ -70,12 +72,10 @@ def run_benchmark(model, name: str, iterations: int, audio_prompt_path: str = No
 
     latencies = []
 
-    # Warmup runs (compile happens here)
-    print("Warmup runs (triggering compilation)...")
-    for i in range(3):
-        _ = measure_time_to_first_audio(model, TEST_TEXTS[i], audio_prompt_path)
-        torch.cuda.empty_cache()
-    print("Warmup complete.\n")
+    # Warmup run
+    print("Warmup run...")
+    _ = measure_time_to_first_audio(model, TEST_TEXTS[0], audio_prompt_path)
+    torch.cuda.empty_cache()
 
     # Benchmark runs
     for i in range(iterations):
@@ -95,24 +95,24 @@ def run_benchmark(model, name: str, iterations: int, audio_prompt_path: str = No
         "latencies": latencies,
     }
 
+    print(f"\nResults for {name}:")
+    print(f"  Mean:   {results['mean']:.3f}s")
+    print(f"  Min:    {results['min']:.3f}s")
+    print(f"  Max:    {results['max']:.3f}s")
+    print(f"  Stdev:  {results['stdev']:.3f}s")
+
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark optimized Chatterbox Turbo")
+    parser = argparse.ArgumentParser(description="Benchmark CUDA vs torch.compile TensorRT")
     parser.add_argument("--iterations", type=int, default=10, help="Number of test iterations")
     parser.add_argument("--audio_prompt", type=str, default=None, help="Reference audio for voice cloning")
-    parser.add_argument("--compile_mode", type=str, default="tensorrt",
-                        choices=["tensorrt", "default", "max-autotune"],
-                        help="Compilation mode")
-    parser.add_argument("--dtype", type=str, default="float16",
-                        choices=["float16", "int8", "bfloat16"],
-                        help="Data type (float16, int8, bfloat16)")
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32"], help="Data type")
     args = parser.parse_args()
 
-    dtype_label = args.dtype.upper()
     print("="*60)
-    print(f"Chatterbox Turbo - Optimized Benchmark ({dtype_label})")
+    print("Chatterbox Turbo Compilation Benchmark")
     print("="*60)
 
     # GPU info
@@ -120,71 +120,104 @@ def main():
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-
-        # Compute capability
-        cc = torch.cuda.get_device_capability(0)
-        print(f"Compute Capability: {cc[0]}.{cc[1]}")
     else:
         print("ERROR: CUDA not available")
         sys.exit(1)
 
-    print(f"Dtype: {args.dtype}")
-    print(f"Compile mode: {args.compile_mode}")
     print(f"Iterations: {args.iterations}")
+    print(f"Dtype: {args.dtype}")
     print(f"Audio prompt: {args.audio_prompt or 'None (using default voice)'}")
 
+    results = {}
+
     # =========================================================================
-    # Load optimized model
+    # Test 1: Plain CUDA (no compilation)
     # =========================================================================
     print("\n" + "="*60)
-    print(f"Loading model with {dtype_label} + torch.compile({args.compile_mode})...")
+    print("Loading model WITHOUT compilation...")
     print("="*60)
 
     load_start = time.perf_counter()
-    model = ChatterboxTurboTTS.from_pretrained(
+    model_cuda = ChatterboxTurboTTS.from_pretrained(
         device="cuda",
         dtype=args.dtype,
-        compile_mode=args.compile_mode,
+        compile_mode=None,  # No compilation
     )
     load_time = time.perf_counter() - load_start
     print(f"Model loaded in {load_time:.2f}s")
 
-    # Run benchmark
-    results = run_benchmark(
-        model,
-        f"{dtype_label} + torch.compile({args.compile_mode})",
+    results["cuda"] = run_benchmark(
+        model_cuda,
+        "CUDA (no compilation)",
         args.iterations,
         args.audio_prompt
     )
+
+    # Free memory
+    del model_cuda
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    # =========================================================================
+    # Test 2: torch.compile with TensorRT backend
+    # =========================================================================
+    print("\n" + "="*60)
+    print("Loading model WITH torch.compile(backend='tensorrt')...")
+    print("="*60)
+
+    load_start = time.perf_counter()
+    model_trt = ChatterboxTurboTTS.from_pretrained(
+        device="cuda",
+        dtype=args.dtype,
+        compile_mode="tensorrt",  # TensorRT compilation
+    )
+    load_time = time.perf_counter() - load_start
+    print(f"Model loaded in {load_time:.2f}s (includes compilation)")
+
+    results["tensorrt"] = run_benchmark(
+        model_trt,
+        "torch.compile(backend='tensorrt')",
+        args.iterations,
+        args.audio_prompt
+    )
+
+    # Free memory
+    del model_trt
+    torch.cuda.empty_cache()
 
     # =========================================================================
     # Summary
     # =========================================================================
     print("\n" + "="*60)
-    print("BENCHMARK RESULTS")
+    print("BENCHMARK SUMMARY")
     print("="*60)
 
-    print(f"\nConfiguration: {dtype_label} + torch.compile({args.compile_mode})")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print("-"*60)
-    print(f"  Mean latency:   {results['mean']:.3f}s")
-    print(f"  Min latency:    {results['min']:.3f}s")
-    print(f"  Max latency:    {results['max']:.3f}s")
-    print(f"  Std deviation:  {results['stdev']:.3f}s")
-    print("-"*60)
+    cuda_mean = results["cuda"]["mean"]
+    trt_mean = results["tensorrt"]["mean"]
 
-    # Performance assessment
-    mean_latency = results['mean']
-    if mean_latency < 0.3:
-        print("Performance: EXCELLENT (< 300ms first chunk)")
-    elif mean_latency < 0.5:
-        print("Performance: VERY GOOD (< 500ms first chunk)")
-    elif mean_latency < 1.0:
-        print("Performance: GOOD (< 1s first chunk)")
+    print(f"\n{'Configuration':<40} {'Mean Latency':<15} {'Min':<10} {'Max':<10}")
+    print("-"*75)
+    print(f"{'CUDA (no compilation)':<40} {cuda_mean:.3f}s{'':<8} {results['cuda']['min']:.3f}s{'':<3} {results['cuda']['max']:.3f}s")
+    print(f"{'torch.compile + TensorRT':<40} {trt_mean:.3f}s{'':<8} {results['tensorrt']['min']:.3f}s{'':<3} {results['tensorrt']['max']:.3f}s")
+
+    # Speedup calculation
+    if trt_mean < cuda_mean:
+        speedup = cuda_mean / trt_mean
+        print(f"\nTensorRT is {speedup:.2f}x FASTER than plain CUDA")
     else:
-        print("Performance: NEEDS OPTIMIZATION (> 1s first chunk)")
+        slowdown = trt_mean / cuda_mean
+        print(f"\nTensorRT is {slowdown:.2f}x SLOWER than plain CUDA")
+        print("(This can happen if compilation overhead dominates short generations)")
 
-    print("="*60)
+    # Recommendation
+    print("\n" + "-"*60)
+    if trt_mean < cuda_mean * 0.9:  # At least 10% faster
+        print("RECOMMENDATION: Use torch.compile with TensorRT for production")
+    elif cuda_mean < trt_mean * 0.9:  # At least 10% slower
+        print("RECOMMENDATION: Use plain CUDA (TensorRT overhead not worth it)")
+    else:
+        print("RECOMMENDATION: Performance is similar, choose based on use case")
+    print("-"*60)
 
 
 if __name__ == "__main__":
