@@ -34,7 +34,7 @@ def debug_audio():
     print("Model loaded!")
 
     # Generate audio
-    text = "Hello, this is a test."
+    text = "Hello, this is a test. I love tests. Ever since I was little, I took tests like this audio one. It was amazing!"
     print(f"\nGenerating audio for: \"{text}\"")
 
     audio_chunks = []
