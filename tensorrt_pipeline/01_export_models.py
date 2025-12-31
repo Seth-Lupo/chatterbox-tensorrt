@@ -295,6 +295,7 @@ def main():
     parser = argparse.ArgumentParser(description="Export Chatterbox Turbo for TensorRT")
     parser.add_argument("--output", type=str, default="exports", help="Output directory")
     parser.add_argument("--skip-download", action="store_true", help="Skip model download (use cached)")
+    parser.add_argument("--token", type=str, default=None, help="HuggingFace token (or set HF_TOKEN env var)")
     args = parser.parse_args()
 
     export_dir = Path(args.output)
@@ -313,9 +314,9 @@ def main():
                     break
         if ckpt_dir is None:
             print("No cached model found, downloading...")
-            ckpt_dir = download_model()
+            ckpt_dir = download_model(token=args.token)
     else:
-        ckpt_dir = download_model()
+        ckpt_dir = download_model(token=args.token)
 
     print(f"\nUsing checkpoint: {ckpt_dir}")
 
