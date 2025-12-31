@@ -45,8 +45,8 @@ def generate_audio(
 
     model = ChatterboxTurboTTS.from_pretrained(
         device="cuda",
-        dtype="bfloat16",  # float16 causes distortion, bfloat16 may work
-        compile_mode=None,  # No torch.compile for simplicity
+        dtype="float32",  # float16/bfloat16 cause distortion
+        compile_mode="reduce-overhead",  # torch.compile for faster inference
     )
     print("Model loaded!")
 
