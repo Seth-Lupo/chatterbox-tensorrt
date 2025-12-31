@@ -60,17 +60,18 @@ echo "Step 1: Export T3 Weights"
 echo "============================================================"
 
 # Run export
+cd "$SCRIPT_DIR/.."
 python3 << 'PYTHON_SCRIPT'
 import sys
 import json
 from pathlib import Path
 
-project_root = Path(__file__).parent.parent if '__file__' in dir() else Path(".").parent
-sys.path.insert(0, str(project_root / "src"))
+# Add src to path
+sys.path.insert(0, "src")
 
 import torch
 
-output_dir = Path("checkpoints/t3_gpt2_hf")
+output_dir = Path("trtllm_t3/checkpoints/t3_gpt2_hf")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 print("Loading T3 model...")
@@ -125,7 +126,7 @@ echo "============================================================"
 echo "Step 2: Run Benchmark (PyTorch with KV Cache)"
 echo "============================================================"
 
-python3 test_trtllm_t3.py --benchmark
+python3 trtllm_t3/test_trtllm_t3.py --benchmark
 
 echo ""
 echo "============================================================"
@@ -143,14 +144,14 @@ if [ "$TRTLLM_AVAILABLE" = true ]; then
         echo "  # Convert checkpoint to TensorRT-LLM format"
         echo "  python3 -m tensorrt_llm.commands.convert_checkpoint \\"
         echo "      --model_type gpt2 \\"
-        echo "      --model_dir checkpoints/t3_gpt2_hf \\"
-        echo "      --output_dir checkpoints/t3_gpt2_trtllm \\"
+        echo "      --model_dir trtllm_t3/checkpoints/t3_gpt2_hf \\"
+        echo "      --output_dir trtllm_t3/checkpoints/t3_gpt2_trtllm \\"
         echo "      --dtype float16"
         echo ""
         echo "  # Build engine"
         echo "  trtllm-build \\"
-        echo "      --checkpoint_dir checkpoints/t3_gpt2_trtllm \\"
-        echo "      --output_dir engines/t3_gpt2 \\"
+        echo "      --checkpoint_dir trtllm_t3/checkpoints/t3_gpt2_trtllm \\"
+        echo "      --output_dir trtllm_t3/engines/t3_gpt2 \\"
         echo "      --gemm_plugin float16 \\"
         echo "      --gpt_attention_plugin float16 \\"
         echo "      --max_batch_size 1 \\"
@@ -173,7 +174,7 @@ echo "============================================================"
 echo "RESULTS"
 echo "============================================================"
 echo ""
-echo "Exported T3 GPT-2 checkpoint: checkpoints/t3_gpt2_hf/"
+echo "Exported T3 GPT-2 checkpoint: trtllm_t3/checkpoints/t3_gpt2_hf/"
 echo ""
 echo "Key findings from benchmarks above show:"
 echo "  - PyTorch with KV cache is already fast"

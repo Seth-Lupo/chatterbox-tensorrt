@@ -24,10 +24,10 @@ import torch
 import numpy as np
 
 # Add project to path
-PROJECT_ROOT = Path(__file__).parent.parent
+SCRIPT_DIR = Path(__file__).parent.resolve()
+PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-SCRIPT_DIR = Path(__file__).parent
 ENGINE_DIR = SCRIPT_DIR / "engines" / "t3_gpt2_engine"
 CHECKPOINT_DIR = SCRIPT_DIR / "checkpoints"
 
