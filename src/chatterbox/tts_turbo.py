@@ -202,11 +202,11 @@ class ChatterboxTurboTTS:
                     truncate_long_and_double=True,
                 )
                 logger.info("S3Gen flow compiled with TensorRT")
-                # Use default torch.compile for T3 (CUDA graphs don't work with autoregressive)
-                self.t3.tfmr = torch.compile(self.t3.tfmr)
-                self.t3.speech_emb = torch.compile(self.t3.speech_emb)
-                self.t3.speech_head = torch.compile(self.t3.speech_head)
-                logger.info("T3 compiled with torch.compile (default mode)")
+                # Use default torch.compile for T3 with dynamic=True for varying sequence lengths
+                self.t3.tfmr = torch.compile(self.t3.tfmr, dynamic=True)
+                self.t3.speech_emb = torch.compile(self.t3.speech_emb, dynamic=True)
+                self.t3.speech_head = torch.compile(self.t3.speech_head, dynamic=True)
+                logger.info("T3 compiled with torch.compile (dynamic=True)")
             except ImportError:
                 logger.warning("torch-tensorrt not installed, falling back to torch.compile")
                 mode = "default"
@@ -218,13 +218,13 @@ class ChatterboxTurboTTS:
             # NOTE: "reduce-overhead" uses CUDA graphs which don't work with
             # autoregressive generation (dynamic shapes, tensor reuse issues).
             # Use "default" mode for streaming/autoregressive workloads.
-            compile_kwargs = {}
+            compile_kwargs = {"dynamic": True}  # Handle varying input sizes without recompilation
             if mode == "reduce-overhead":
                 logger.warning("reduce-overhead mode may cause issues with streaming generation")
-                compile_kwargs = {"mode": "reduce-overhead"}
+                compile_kwargs["mode"] = "reduce-overhead"
             elif mode == "max-autotune":
-                compile_kwargs = {"mode": "max-autotune"}
-            # "default" mode uses no special options
+                compile_kwargs["mode"] = "max-autotune"
+            # "default" mode uses no special options (just dynamic=True)
 
             # Compile T3 transformer
             self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
@@ -233,7 +233,7 @@ class ChatterboxTurboTTS:
             self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
             # Compile S3Gen flow model
             self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'})")
+            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'}, dynamic=True)")
 
         self._compiled = True
 
