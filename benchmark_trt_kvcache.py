@@ -121,9 +121,9 @@ def test_kv_cache():
     print(f"\nTest: 50 token sequence")
     print(f"Input shape: {full_embeds.shape}")
 
-    # Method 1: Process all at once (no cache)
+    # Method 1: Process all at once (WITH cache enabled for consistency)
     with torch.no_grad():
-        output_full, _ = wrapper(full_embeds, past_key_values=None, use_cache=False)
+        output_full, _ = wrapper(full_embeds, past_key_values=None, use_cache=True)
 
     print(f"Full pass output shape: {output_full.shape}")
 
@@ -144,15 +144,27 @@ def test_kv_cache():
 
     print(f"Incremental output shape: {output_incremental.shape}")
 
-    # Compare
-    diff = (output_full - output_incremental).abs().max().item()
-    print(f"\nMax difference: {diff:.6f}")
+    # Compare outputs at each part separately
+    diff_chunk1 = (output_full[:, :30, :] - output1).abs().max().item()
+    diff_chunk2 = (output_full[:, 30:, :] - output2).abs().max().item()
+    diff_total = (output_full - output_incremental).abs().max().item()
 
-    if diff < 1e-2:  # Allow slightly higher tolerance for fp16
+    print(f"\nMax difference chunk1 (positions 0-29): {diff_chunk1:.6f}")
+    print(f"Max difference chunk2 (positions 30-49): {diff_chunk2:.6f}")
+    print(f"Max difference total: {diff_total:.6f}")
+
+    # The first chunk should match exactly (no cache involved)
+    # The second chunk uses cache, so small fp16 differences are acceptable
+    if diff_chunk1 < 1e-5 and diff_chunk2 < 1e-2:
         print("✓ KV Cache is working correctly!")
         return True, wrapper, model
     else:
         print("✗ KV Cache mismatch - outputs differ")
+        # Debug: show where differences are largest
+        if diff_chunk1 >= 1e-5:
+            print(f"  Problem: Chunk1 differs (should be identical)")
+        if diff_chunk2 >= 1e-2:
+            print(f"  Problem: Chunk2 differs too much")
         return False, wrapper, model
 
 
