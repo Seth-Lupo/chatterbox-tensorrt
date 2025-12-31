@@ -281,6 +281,8 @@ class SourceModuleHnNSF(torch.nn.Module):
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
+        # Cast uv to model dtype as well
+        uv = uv.to(dtype=self.l_linear.weight.dtype)
         noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
 
@@ -396,24 +398,35 @@ class HiFTGenerator(nn.Module):
             l.remove_weight_norm()
 
     def _stft(self, x):
+        # STFT requires float32 input for numerical stability
+        x_float = x.float() if x.dtype != torch.float32 else x
         spec = torch.stft(
-            x,
-            self.istft_params["n_fft"], self.istft_params["hop_len"], self.istft_params["n_fft"], window=self.stft_window.to(x.device),
+            x_float,
+            self.istft_params["n_fft"], self.istft_params["hop_len"], self.istft_params["n_fft"],
+            window=self.stft_window.to(x.device),
             return_complex=True)
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
         return spec[..., 0], spec[..., 1]
 
     def _istft(self, magnitude, phase):
+        # Store original dtype for output
+        orig_dtype = magnitude.dtype
+        # ISTFT requires float32 for numerical stability
+        magnitude = magnitude.float()
+        phase = phase.float()
         magnitude = torch.clip(magnitude, max=1e2)
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
         inverse_transform = torch.istft(torch.complex(real, img), self.istft_params["n_fft"], self.istft_params["hop_len"],
                                         self.istft_params["n_fft"], window=self.stft_window.to(magnitude.device))
-        return inverse_transform
+        # Cast back to original dtype
+        return inverse_transform.to(dtype=orig_dtype)
 
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        # Cast to model dtype (STFT outputs float32)
+        s_stft = s_stft.to(dtype=x.dtype)
 
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
