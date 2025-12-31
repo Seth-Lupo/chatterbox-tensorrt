@@ -40,7 +40,8 @@ class GPT2BlockWithCache(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = True,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        # GPT2Block already handles this internally
+        # GPT2Block returns tuple: (hidden_states, present, ...)
+        # present is only returned if use_cache=True
         outputs = self.block(
             hidden_states,
             layer_past=past_key_value,
@@ -48,7 +49,12 @@ class GPT2BlockWithCache(nn.Module):
         )
 
         hidden_states = outputs[0]
-        new_past_key_value = outputs[1] if use_cache else None
+
+        # Check if present (KV cache) was returned
+        if use_cache and len(outputs) > 1:
+            new_past_key_value = outputs[1]
+        else:
+            new_past_key_value = None
 
         return hidden_states, new_past_key_value
 
@@ -136,6 +142,28 @@ def test_kv_cache():
         dtype="float16",
         compile_mode=None,
     )
+
+    # Debug: Check what GPT2Block returns
+    print("\nDebug: Checking GPT2Block output format...")
+    test_input = torch.randn(1, 10, model.t3.cfg.hidden_size, device="cuda", dtype=torch.float16)
+    block = model.t3.tfmr.h[0]
+    with torch.no_grad():
+        block_out = block(test_input, use_cache=True)
+    print(f"  Block output type: {type(block_out)}")
+    print(f"  Block output length: {len(block_out)}")
+    for i, item in enumerate(block_out):
+        if item is not None:
+            if isinstance(item, torch.Tensor):
+                print(f"  outputs[{i}]: Tensor shape {item.shape}")
+            elif isinstance(item, tuple):
+                print(f"  outputs[{i}]: Tuple of {len(item)} items")
+                for j, sub in enumerate(item):
+                    if isinstance(sub, torch.Tensor):
+                        print(f"    [{j}]: Tensor shape {sub.shape}")
+            else:
+                print(f"  outputs[{i}]: {type(item)}")
+        else:
+            print(f"  outputs[{i}]: None")
 
     # Create wrapper with KV cache
     wrapper = GPT2WithKVCache(model.t3.tfmr).cuda().half().eval()
