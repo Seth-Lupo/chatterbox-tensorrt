@@ -42,7 +42,8 @@ TEST_TEXTS = [
 
 
 class GPT2TransformerWrapper(nn.Module):
-    """Wrapper that calls GPT2 transformer blocks directly with embeddings input."""
+    """Wrapper that calls GPT2 transformer blocks directly with embeddings input.
+    Returns just the tensor (for TensorRT compatibility)."""
 
     def __init__(self, gpt2_model):
         super().__init__()
@@ -51,7 +52,7 @@ class GPT2TransformerWrapper(nn.Module):
         self.h = gpt2_model.h
         self.ln_f = gpt2_model.ln_f
 
-    def forward(self, inputs_embeds, **kwargs):
+    def forward(self, inputs_embeds):
         # inputs_embeds: (batch, seq_len, hidden_size)
         batch_size, seq_len, _ = inputs_embeds.shape
         device = inputs_embeds.device
@@ -71,7 +72,22 @@ class GPT2TransformerWrapper(nn.Module):
         # Final layer norm
         hidden_states = self.ln_f(hidden_states)
 
-        # Return in format expected by T3 (BaseModelOutputWithPastAndCrossAttentions-like)
+        # Return just the tensor (TensorRT compatible)
+        return hidden_states
+
+
+class CompiledTransformerAdapter(nn.Module):
+    """Adapts compiled transformer output to match what T3 expects."""
+
+    def __init__(self, compiled_tfmr):
+        super().__init__()
+        self.compiled_tfmr = compiled_tfmr
+
+    def forward(self, inputs_embeds, **kwargs):
+        # Call compiled model (returns just tensor)
+        hidden_states = self.compiled_tfmr(inputs_embeds)
+
+        # Wrap in object that T3 expects (supports indexing and .last_hidden_state)
         class Output:
             def __init__(self, last_hidden_state):
                 self.last_hidden_state = last_hidden_state
@@ -93,6 +109,13 @@ def compile_transformer_trt(model):
 
     hidden_size = model.t3.cfg.hidden_size
 
+    # Test the wrapper first
+    print("Testing wrapper...")
+    test_input = torch.randn(1, 10, hidden_size, device=model.device, dtype=model.dtype)
+    with torch.no_grad():
+        test_out = wrapped(test_input)
+    print(f"  Wrapper output shape: {test_out.shape}")
+
     print("Compiling with TensorRT (this takes ~20 seconds)...")
     compiled = torch_tensorrt.compile(
         wrapped,
@@ -108,7 +131,10 @@ def compile_transformer_trt(model):
         truncate_long_and_double=True,
     )
 
-    return compiled, wrapped
+    # Wrap the compiled model with adapter that returns expected format
+    adapter = CompiledTransformerAdapter(compiled)
+
+    return adapter, wrapped
 
 
 def measure_time_to_first_audio(model, text: str) -> float:
@@ -218,13 +244,12 @@ def main():
     print("="*60)
 
     try:
-        compiled_tfmr, wrapped_tfmr = compile_transformer_trt(model)
+        adapter, wrapped_tfmr = compile_transformer_trt(model)
         print("Compilation successful!")
 
-        # Swap in the compiled transformer
-        # We need to monkey-patch T3 to use our wrapper
+        # Swap in the compiled transformer adapter
         original_tfmr = model.t3.tfmr
-        model.t3.tfmr = compiled_tfmr
+        model.t3.tfmr = adapter
 
         # Run TensorRT benchmark
         trt_results = run_benchmark(model, "TensorRT-compiled transformer", args.iterations)
