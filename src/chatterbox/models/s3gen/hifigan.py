@@ -276,6 +276,8 @@ class SourceModuleHnNSF(torch.nn.Module):
             sine_wavs, uv, _ = self.l_sin_gen(x.transpose(1, 2))
             sine_wavs = sine_wavs.transpose(1, 2)
             uv = uv.transpose(1, 2)
+        # Cast to model dtype (SineGen outputs float32 due to trig ops)
+        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
