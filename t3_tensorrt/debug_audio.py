@@ -37,14 +37,12 @@ def debug_audio():
     text = "Hello, this is a test. I love tests. Ever since I was little, I took tests like this audio one. It was amazing!"
     print(f"\nGenerating audio for: \"{text}\"")
 
-    audio_chunks = []
-    for chunk, metrics in model.generate_stream(
+    # Use non-streaming generation for coherent audio
+    # (streaming mode has chunk boundary artifacts causing jittery intonation)
+    audio = model.generate(
         text=text,
         audio_prompt_path=None,
-    ):
-        audio_chunks.append(chunk)
-
-    audio = torch.cat(audio_chunks, dim=-1)
+    )
     sr = model.sr
 
     # Debug info

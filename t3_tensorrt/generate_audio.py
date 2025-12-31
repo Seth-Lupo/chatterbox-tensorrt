@@ -58,16 +58,12 @@ def generate_audio(
     torch.cuda.synchronize()
     start_time = time.perf_counter()
 
-    # Collect audio chunks from streaming generation
-    audio_chunks = []
-    for chunk, metrics in model.generate_stream(
+    # Use non-streaming generation for coherent audio
+    # (streaming has chunk boundary artifacts)
+    audio = model.generate(
         text=text,
         audio_prompt_path=audio_prompt_path,
-    ):
-        audio_chunks.append(chunk)
-
-    # Concatenate all chunks
-    audio = torch.cat(audio_chunks, dim=-1)
+    )
     sr = model.sr
 
     torch.cuda.synchronize()
