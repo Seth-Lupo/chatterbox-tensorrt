@@ -57,16 +57,22 @@ class T3TensorRTTransformer:
         # Create execution context
         self.context = self.engine.create_execution_context()
 
-        # Get input/output info
+        # Get input/output info (TensorRT 10.x API)
         self.input_name = "inputs_embeds"
         self.output_name = "hidden_states"
 
-        # Get binding indices
-        self.input_idx = self.engine.get_binding_index(self.input_name)
-        self.output_idx = self.engine.get_binding_index(self.output_name)
+        # TensorRT 10.x uses different API for bindings
+        self.num_io_tensors = self.engine.num_io_tensors
+        print(f"  Number of I/O tensors: {self.num_io_tensors}")
 
-        print(f"  Input binding: {self.input_name} (idx={self.input_idx})")
-        print(f"  Output binding: {self.output_name} (idx={self.output_idx})")
+        # Find input and output tensor indices
+        for i in range(self.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            mode = self.engine.get_tensor_mode(name)
+            print(f"  Tensor {i}: {name} ({mode})")
+
+        print(f"  Input: {self.input_name}")
+        print(f"  Output: {self.output_name}")
 
         # Pre-allocate output buffer for common sizes
         self._output_buffer = None
@@ -102,8 +108,8 @@ class T3TensorRTTransformer:
 
         batch_size, seq_len, hidden_size = inputs_embeds.shape
 
-        # Set input shape for dynamic axes
-        self.context.set_binding_shape(self.input_idx, (batch_size, seq_len, hidden_size))
+        # Set input shape for dynamic axes (TensorRT 10.x API)
+        self.context.set_input_shape(self.input_name, (batch_size, seq_len, hidden_size))
 
         # Prepare output buffer
         output = torch.empty(
@@ -112,15 +118,17 @@ class T3TensorRTTransformer:
             device=inputs_embeds.device,
         )
 
-        # Get data pointers
-        bindings = [None, None]
-        bindings[self.input_idx] = inputs_embeds.data_ptr()
-        bindings[self.output_idx] = output.data_ptr()
+        # Set tensor addresses (TensorRT 10.x API)
+        self.context.set_tensor_address(self.input_name, inputs_embeds.data_ptr())
+        self.context.set_tensor_address(self.output_name, output.data_ptr())
 
         # Run inference
-        success = self.context.execute_v2(bindings)
+        success = self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
         if not success:
             raise RuntimeError("TensorRT inference failed")
+
+        # Sync stream
+        torch.cuda.current_stream().synchronize()
 
         return output
 

@@ -42,7 +42,7 @@ fi
 echo "Running trtexec..."
 echo ""
 
-trtexec \
+/usr/local/tensorrt/bin/trtexec \
     --onnx="$ONNX_FILE" \
     --saveEngine="$ENGINE_FILE" \
     $FP16 \
