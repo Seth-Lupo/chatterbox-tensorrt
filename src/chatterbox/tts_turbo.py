@@ -174,13 +174,10 @@ class ChatterboxTurboTTS:
 
         Args:
             mode: Compilation mode
-                - "default": torch.compile with default settings (recommended for streaming)
-                - "reduce-overhead": Uses CUDA graphs (NOT recommended for autoregressive)
+                - "default": torch.compile with default settings
+                - "reduce-overhead": Optimized for small batches (good for streaming)
                 - "max-autotune": Maximum optimization (slower compile, faster run)
                 - "tensorrt": Use TensorRT backend (requires torch-tensorrt)
-
-        Note: "reduce-overhead" mode uses CUDA graphs which don't work well with
-        autoregressive generation. Use "default" mode for streaming TTS.
         """
         if self._compiled:
             logger.warning("Models already compiled, skipping")
@@ -191,32 +188,43 @@ class ChatterboxTurboTTS:
         if mode == "tensorrt":
             try:
                 import torch_tensorrt
-                # TensorRT compilation for T3 transformer
-                self.t3.tfmr = torch_tensorrt.compile(
-                    self.t3.tfmr,
+                # TensorRT compilation for S3Gen flow (works better than T3 for TRT)
+                # T3 uses autoregressive generation which doesn't benefit as much from TRT
+                self.s3gen.flow = torch_tensorrt.compile(
+                    self.s3gen.flow,
                     inputs=[torch_tensorrt.Input(
-                        min_shape=[1, 1, 1024],
-                        opt_shape=[1, 512, 1024],
-                        max_shape=[1, 2048, 1024],
+                        min_shape=[1, 80, 10],
+                        opt_shape=[1, 80, 200],
+                        max_shape=[1, 80, 1000],
                         dtype=torch.float16 if self.dtype == torch.float16 else torch.float32,
                     )],
                     enabled_precisions={torch.float16} if self.dtype == torch.float16 else {torch.float32},
                     truncate_long_and_double=True,
                 )
-                logger.info("T3 compiled with TensorRT")
+                logger.info("S3Gen flow compiled with TensorRT")
+                # Use default torch.compile for T3 (CUDA graphs don't work with autoregressive)
+                self.t3.tfmr = torch.compile(self.t3.tfmr)
+                self.t3.speech_emb = torch.compile(self.t3.speech_emb)
+                self.t3.speech_head = torch.compile(self.t3.speech_head)
+                logger.info("T3 compiled with torch.compile (default mode)")
             except ImportError:
                 logger.warning("torch-tensorrt not installed, falling back to torch.compile")
-                mode = "default"  # Use default, not reduce-overhead (CUDA graphs issue)
+                mode = "default"
             except Exception as e:
                 logger.warning(f"TensorRT compilation failed: {e}, falling back to torch.compile")
-                mode = "default"  # Use default, not reduce-overhead (CUDA graphs issue)
+                mode = "default"
 
         if mode != "tensorrt":
+            # NOTE: "reduce-overhead" uses CUDA graphs which don't work with
+            # autoregressive generation (dynamic shapes, tensor reuse issues).
+            # Use "default" mode for streaming/autoregressive workloads.
             compile_kwargs = {}
             if mode == "reduce-overhead":
+                logger.warning("reduce-overhead mode may cause issues with streaming generation")
                 compile_kwargs = {"mode": "reduce-overhead"}
             elif mode == "max-autotune":
                 compile_kwargs = {"mode": "max-autotune"}
+            # "default" mode uses no special options
 
             # Compile T3 transformer
             self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
@@ -225,7 +233,7 @@ class ChatterboxTurboTTS:
             self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
             # Compile S3Gen flow model
             self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-            logger.info(f"Models compiled with torch.compile (mode={mode})")
+            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'})")
 
         self._compiled = True
 

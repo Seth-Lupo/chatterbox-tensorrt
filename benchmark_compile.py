@@ -159,30 +159,30 @@ def main():
     torch.cuda.synchronize()
 
     # =========================================================================
-    # Test 2: torch.compile with inductor backend (stable for autoregressive)
+    # Test 2: torch.compile with TensorRT backend
     # =========================================================================
     print("\n" + "="*60)
-    print("Loading model WITH torch.compile(backend='inductor')...")
+    print("Loading model WITH torch.compile(backend='tensorrt')...")
     print("="*60)
 
     load_start = time.perf_counter()
-    model_compiled = ChatterboxTurboTTS.from_pretrained(
+    model_trt = ChatterboxTurboTTS.from_pretrained(
         device="cuda",
         dtype=args.dtype,
-        compile_mode="default",  # Uses inductor backend, no CUDA graphs
+        compile_mode="tensorrt",  # TensorRT compilation
     )
     load_time = time.perf_counter() - load_start
     print(f"Model loaded in {load_time:.2f}s (includes compilation)")
 
-    results["compiled"] = run_benchmark(
-        model_compiled,
-        "torch.compile(backend='inductor')",
+    results["tensorrt"] = run_benchmark(
+        model_trt,
+        "torch.compile(backend='tensorrt')",
         args.iterations,
         args.audio_prompt
     )
 
     # Free memory
-    del model_compiled
+    del model_trt
     torch.cuda.empty_cache()
 
     # =========================================================================
@@ -193,28 +193,28 @@ def main():
     print("="*60)
 
     cuda_mean = results["cuda"]["mean"]
-    compiled_mean = results["compiled"]["mean"]
+    trt_mean = results["tensorrt"]["mean"]
 
     print(f"\n{'Configuration':<40} {'Mean Latency':<15} {'Min':<10} {'Max':<10}")
     print("-"*75)
     print(f"{'CUDA (no compilation)':<40} {cuda_mean:.3f}s{'':<8} {results['cuda']['min']:.3f}s{'':<3} {results['cuda']['max']:.3f}s")
-    print(f"{'torch.compile (inductor)':<40} {compiled_mean:.3f}s{'':<8} {results['compiled']['min']:.3f}s{'':<3} {results['compiled']['max']:.3f}s")
+    print(f"{'torch.compile + TensorRT':<40} {trt_mean:.3f}s{'':<8} {results['tensorrt']['min']:.3f}s{'':<3} {results['tensorrt']['max']:.3f}s")
 
     # Speedup calculation
-    if compiled_mean < cuda_mean:
-        speedup = cuda_mean / compiled_mean
-        print(f"\ntorch.compile is {speedup:.2f}x FASTER than plain CUDA")
+    if trt_mean < cuda_mean:
+        speedup = cuda_mean / trt_mean
+        print(f"\nTensorRT is {speedup:.2f}x FASTER than plain CUDA")
     else:
-        slowdown = compiled_mean / cuda_mean
-        print(f"\ntorch.compile is {slowdown:.2f}x SLOWER than plain CUDA")
+        slowdown = trt_mean / cuda_mean
+        print(f"\nTensorRT is {slowdown:.2f}x SLOWER than plain CUDA")
         print("(This can happen if compilation overhead dominates short generations)")
 
     # Recommendation
     print("\n" + "-"*60)
-    if compiled_mean < cuda_mean * 0.9:  # At least 10% faster
-        print("RECOMMENDATION: Use torch.compile for production")
-    elif cuda_mean < compiled_mean * 0.9:  # At least 10% slower
-        print("RECOMMENDATION: Use plain CUDA (compilation overhead not worth it)")
+    if trt_mean < cuda_mean * 0.9:  # At least 10% faster
+        print("RECOMMENDATION: Use torch.compile with TensorRT for production")
+    elif cuda_mean < trt_mean * 0.9:  # At least 10% slower
+        print("RECOMMENDATION: Use plain CUDA (TensorRT overhead not worth it)")
     else:
         print("RECOMMENDATION: Performance is similar, choose based on use case")
     print("-"*60)
