@@ -174,10 +174,13 @@ class ChatterboxTurboTTS:
 
         Args:
             mode: Compilation mode
-                - "default": torch.compile with default settings
-                - "reduce-overhead": Optimized for small batches (good for streaming)
+                - "default": torch.compile with default settings (recommended for streaming)
+                - "reduce-overhead": Uses CUDA graphs (NOT recommended for autoregressive)
                 - "max-autotune": Maximum optimization (slower compile, faster run)
                 - "tensorrt": Use TensorRT backend (requires torch-tensorrt)
+
+        Note: "reduce-overhead" mode uses CUDA graphs which don't work well with
+        autoregressive generation. Use "default" mode for streaming TTS.
         """
         if self._compiled:
             logger.warning("Models already compiled, skipping")
@@ -203,10 +206,10 @@ class ChatterboxTurboTTS:
                 logger.info("T3 compiled with TensorRT")
             except ImportError:
                 logger.warning("torch-tensorrt not installed, falling back to torch.compile")
-                mode = "reduce-overhead"
+                mode = "default"  # Use default, not reduce-overhead (CUDA graphs issue)
             except Exception as e:
                 logger.warning(f"TensorRT compilation failed: {e}, falling back to torch.compile")
-                mode = "reduce-overhead"
+                mode = "default"  # Use default, not reduce-overhead (CUDA graphs issue)
 
         if mode != "tensorrt":
             compile_kwargs = {}
