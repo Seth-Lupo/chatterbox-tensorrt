@@ -185,55 +185,19 @@ class ChatterboxTurboTTS:
 
         logger.info(f"Compiling models with mode: {mode}")
 
-        if mode == "tensorrt":
-            try:
-                import torch_tensorrt
-                # TensorRT compilation for S3Gen flow (works better than T3 for TRT)
-                # T3 uses autoregressive generation which doesn't benefit as much from TRT
-                self.s3gen.flow = torch_tensorrt.compile(
-                    self.s3gen.flow,
-                    inputs=[torch_tensorrt.Input(
-                        min_shape=[1, 80, 10],
-                        opt_shape=[1, 80, 200],
-                        max_shape=[1, 80, 1000],
-                        dtype=torch.float16 if self.dtype == torch.float16 else torch.float32,
-                    )],
-                    enabled_precisions={torch.float16} if self.dtype == torch.float16 else {torch.float32},
-                    truncate_long_and_double=True,
-                )
-                logger.info("S3Gen flow compiled with TensorRT")
-                # Use default torch.compile for T3 (CUDA graphs don't work with autoregressive)
-                self.t3.tfmr = torch.compile(self.t3.tfmr)
-                self.t3.speech_emb = torch.compile(self.t3.speech_emb)
-                self.t3.speech_head = torch.compile(self.t3.speech_head)
-                logger.info("T3 compiled with torch.compile (default mode)")
-            except ImportError:
-                logger.warning("torch-tensorrt not installed, falling back to torch.compile")
-                mode = "default"
-            except Exception as e:
-                logger.warning(f"TensorRT compilation failed: {e}, falling back to torch.compile")
-                mode = "default"
+        # Use dynamic=True to avoid recompilation on different input shapes
+        compile_kwargs = {"dynamic": True}
 
-        if mode != "tensorrt":
-            # NOTE: "reduce-overhead" uses CUDA graphs which don't work with
-            # autoregressive generation (dynamic shapes, tensor reuse issues).
-            # Use "default" mode for streaming/autoregressive workloads.
-            compile_kwargs = {}
-            if mode == "reduce-overhead":
-                logger.warning("reduce-overhead mode may cause issues with streaming generation")
-                compile_kwargs = {"mode": "reduce-overhead"}
-            elif mode == "max-autotune":
-                compile_kwargs = {"mode": "max-autotune"}
-            # "default" mode uses no special options
+        if mode == "max-autotune":
+            compile_kwargs["mode"] = "max-autotune"
 
-            # Compile T3 transformer
-            self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
-            # Compile speech embedding and head
-            self.t3.speech_emb = torch.compile(self.t3.speech_emb, **compile_kwargs)
-            self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
-            # Compile S3Gen flow model
-            self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'})")
+        # Compile T3 transformer and components
+        self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
+        self.t3.speech_emb = torch.compile(self.t3.speech_emb, **compile_kwargs)
+        self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
+        # Compile S3Gen flow model
+        self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
+        logger.info(f"Models compiled with torch.compile (dynamic=True, mode={mode})")
 
         self._compiled = True
 

@@ -128,61 +128,31 @@ def main():
     print(f"Dtype: {args.dtype}")
     print(f"Audio prompt: {args.audio_prompt or 'None (using default voice)'}")
 
-    results = {}
-
     # =========================================================================
-    # Test 1: Plain CUDA (no compilation)
+    # Load and benchmark compiled model
     # =========================================================================
     print("\n" + "="*60)
-    print("Loading model WITHOUT compilation...")
+    print("Loading model with torch.compile (dynamic=True)...")
     print("="*60)
 
     load_start = time.perf_counter()
-    model_cuda = ChatterboxTurboTTS.from_pretrained(
+    model = ChatterboxTurboTTS.from_pretrained(
         device="cuda",
         dtype=args.dtype,
-        compile_mode=None,  # No compilation
+        compile_mode="default",  # Uses dynamic=True internally
     )
     load_time = time.perf_counter() - load_start
     print(f"Model loaded in {load_time:.2f}s")
 
-    results["cuda"] = run_benchmark(
-        model_cuda,
-        "CUDA (no compilation)",
+    results = run_benchmark(
+        model,
+        "torch.compile (dynamic=True)",
         args.iterations,
         args.audio_prompt
     )
 
     # Free memory
-    del model_cuda
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-    # =========================================================================
-    # Test 2: torch.compile with TensorRT backend
-    # =========================================================================
-    print("\n" + "="*60)
-    print("Loading model WITH torch.compile(backend='tensorrt')...")
-    print("="*60)
-
-    load_start = time.perf_counter()
-    model_trt = ChatterboxTurboTTS.from_pretrained(
-        device="cuda",
-        dtype=args.dtype,
-        compile_mode="tensorrt",  # TensorRT compilation
-    )
-    load_time = time.perf_counter() - load_start
-    print(f"Model loaded in {load_time:.2f}s (includes compilation)")
-
-    results["tensorrt"] = run_benchmark(
-        model_trt,
-        "torch.compile(backend='tensorrt')",
-        args.iterations,
-        args.audio_prompt
-    )
-
-    # Free memory
-    del model_trt
+    del model
     torch.cuda.empty_cache()
 
     # =========================================================================
@@ -192,32 +162,23 @@ def main():
     print("BENCHMARK SUMMARY")
     print("="*60)
 
-    cuda_mean = results["cuda"]["mean"]
-    trt_mean = results["tensorrt"]["mean"]
+    print(f"\n{'Metric':<30} {'Value':<15}")
+    print("-"*45)
+    print(f"{'Mean latency to first chunk':<30} {results['mean']:.3f}s")
+    print(f"{'Min latency':<30} {results['min']:.3f}s")
+    print(f"{'Max latency':<30} {results['max']:.3f}s")
+    print(f"{'Std dev':<30} {results['stdev']:.3f}s")
+    print(f"{'Iterations':<30} {results['iterations']}")
 
-    print(f"\n{'Configuration':<40} {'Mean Latency':<15} {'Min':<10} {'Max':<10}")
-    print("-"*75)
-    print(f"{'CUDA (no compilation)':<40} {cuda_mean:.3f}s{'':<8} {results['cuda']['min']:.3f}s{'':<3} {results['cuda']['max']:.3f}s")
-    print(f"{'torch.compile + TensorRT':<40} {trt_mean:.3f}s{'':<8} {results['tensorrt']['min']:.3f}s{'':<3} {results['tensorrt']['max']:.3f}s")
-
-    # Speedup calculation
-    if trt_mean < cuda_mean:
-        speedup = cuda_mean / trt_mean
-        print(f"\nTensorRT is {speedup:.2f}x FASTER than plain CUDA")
+    # Real-time assessment
+    print("\n" + "-"*45)
+    if results['mean'] < 0.5:
+        print("EXCELLENT: Sub-500ms first chunk latency")
+    elif results['mean'] < 1.0:
+        print("GOOD: Sub-1s first chunk latency")
     else:
-        slowdown = trt_mean / cuda_mean
-        print(f"\nTensorRT is {slowdown:.2f}x SLOWER than plain CUDA")
-        print("(This can happen if compilation overhead dominates short generations)")
-
-    # Recommendation
-    print("\n" + "-"*60)
-    if trt_mean < cuda_mean * 0.9:  # At least 10% faster
-        print("RECOMMENDATION: Use torch.compile with TensorRT for production")
-    elif cuda_mean < trt_mean * 0.9:  # At least 10% slower
-        print("RECOMMENDATION: Use plain CUDA (TensorRT overhead not worth it)")
-    else:
-        print("RECOMMENDATION: Performance is similar, choose based on use case")
-    print("-"*60)
+        print("Consider optimization for lower latency")
+    print("-"*45)
 
 
 if __name__ == "__main__":
