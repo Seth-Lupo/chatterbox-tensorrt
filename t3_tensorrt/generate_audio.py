@@ -20,7 +20,8 @@ import time
 from pathlib import Path
 
 import torch
-import torchaudio
+import numpy as np
+from scipy.io import wavfile
 
 # Add project to path
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -86,10 +87,15 @@ def generate_audio(
 
     # Ensure audio is on CPU and correct shape
     audio_cpu = audio.cpu()
-    if audio_cpu.dim() == 1:
-        audio_cpu = audio_cpu.unsqueeze(0)
+    if audio_cpu.dim() == 2:
+        audio_cpu = audio_cpu.squeeze(0)  # Remove batch dim for mono
 
-    torchaudio.save(str(output_path), audio_cpu, sr)
+    # Convert to int16 for WAV
+    audio_np = audio_cpu.numpy()
+    audio_np = np.clip(audio_np, -1.0, 1.0)  # Clip to valid range
+    audio_int16 = (audio_np * 32767).astype(np.int16)
+
+    wavfile.write(str(output_path), sr, audio_int16)
     print(f"  Saved! ({output_path.stat().st_size / 1024:.1f} KB)")
 
     return audio, sr, gen_time
