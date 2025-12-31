@@ -35,12 +35,23 @@ REPO_ID = "ResembleAI/chatterbox-turbo"
 EXPORT_DIR = Path("exports")
 
 
-def download_model():
+def download_model(token: str = None):
     """Download model from HuggingFace."""
     print("Downloading Chatterbox Turbo from HuggingFace...")
+
+    # Get token from argument, env var, or cached login
+    hf_token = token or os.getenv("HF_TOKEN")
+    if not hf_token:
+        print("Note: No HF_TOKEN provided. Trying cached login...")
+        print("If this fails, either:")
+        print("  1. Run: huggingface-cli login")
+        print("  2. Or pass: --token YOUR_TOKEN")
+        print("  3. Or set: export HF_TOKEN=YOUR_TOKEN")
+        hf_token = True  # Use cached credentials
+
     local_path = snapshot_download(
         repo_id=REPO_ID,
-        token=os.getenv("HF_TOKEN") or True,
+        token=hf_token,
         allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"]
     )
     print(f"Downloaded to: {local_path}")
