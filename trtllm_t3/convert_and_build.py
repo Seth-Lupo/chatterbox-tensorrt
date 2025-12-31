@@ -182,10 +182,10 @@ def convert_hf_to_trtllm():
     # Save as safetensors (TensorRT-LLM format)
     print(f"\nSaving to {TRTLLM_CHECKPOINT}...")
 
-    # Convert all weights to torch tensors in float16
+    # Convert all weights to torch tensors in float16 (must be contiguous)
     torch_weights = {}
     for name, weight in trtllm_weights.items():
-        torch_weights[name] = torch.from_numpy(weight.astype(np.float16))
+        torch_weights[name] = torch.from_numpy(weight.astype(np.float16)).contiguous()
 
     # Save as safetensors
     try:
