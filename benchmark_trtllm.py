@@ -147,6 +147,40 @@ def try_trtllm_gpt2_conversion():
         return False
 
 
+class GPT2TransformerWrapper(torch.nn.Module):
+    """Wrapper that calls GPT2 transformer blocks directly with embeddings input."""
+
+    def __init__(self, gpt2_model):
+        super().__init__()
+        # Copy the transformer components we need
+        self.wpe = gpt2_model.wpe
+        self.drop = gpt2_model.drop
+        self.h = gpt2_model.h
+        self.ln_f = gpt2_model.ln_f
+
+    def forward(self, inputs_embeds):
+        # inputs_embeds: (batch, seq_len, hidden_size)
+        batch_size, seq_len, _ = inputs_embeds.shape
+        device = inputs_embeds.device
+
+        # Position embeddings
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        position_embeds = self.wpe(position_ids)
+
+        hidden_states = inputs_embeds + position_embeds
+        hidden_states = self.drop(hidden_states)
+
+        # Transformer blocks
+        for block in self.h:
+            outputs = block(hidden_states)
+            hidden_states = outputs[0]
+
+        # Final layer norm
+        hidden_states = self.ln_f(hidden_states)
+
+        return hidden_states
+
+
 def try_torch_tensorrt_for_t3():
     """Try using torch-tensorrt to compile T3 transformer."""
     print("\n" + "="*60)
@@ -167,23 +201,30 @@ def try_torch_tensorrt_for_t3():
             compile_mode=None,
         )
 
-        # Get the transformer
+        # Get the transformer and wrap it
         tfmr = model.t3.tfmr
-        tfmr.eval()
-
-        print(f"\nTransformer type: {type(tfmr)}")
+        print(f"\nOriginal transformer type: {type(tfmr)}")
         print(f"Hidden size: {model.t3.cfg.hidden_size}")
 
-        # Create example input (embeddings, not tokens)
+        # Create wrapper that works with embeddings directly
+        print("\nCreating wrapper for embeddings-based input...")
+        wrapped_tfmr = GPT2TransformerWrapper(tfmr).cuda().half().eval()
+
         hidden_size = model.t3.cfg.hidden_size
         example_input = torch.randn(1, 100, hidden_size, device="cuda", dtype=torch.float16)
 
-        print(f"\nCompiling transformer with torch-tensorrt...")
+        # Test wrapper works
+        print("Testing wrapper...")
+        with torch.no_grad():
+            test_out = wrapped_tfmr(example_input)
+        print(f"  Wrapper output shape: {test_out.shape}")
+
+        print(f"\nCompiling wrapped transformer with torch-tensorrt...")
         print(f"  Input shape: {example_input.shape}")
 
         # Try dynamic shapes
         compiled_tfmr = torch_tensorrt.compile(
-            tfmr,
+            wrapped_tfmr,
             inputs=[
                 torch_tensorrt.Input(
                     min_shape=[1, 1, hidden_size],
