@@ -60,10 +60,13 @@ def check_t3_architecture():
 
     t3 = T3(hp)
 
+    # Get the actual GPT2 config from the model
+    gpt_cfg = t3.cfg
+
     print(f"  T3 config:")
-    print(f"    hidden_size: {hp.hidden_size}")
-    print(f"    num_hidden_layers: {hp.num_hidden_layers}")
-    print(f"    num_attention_heads: {hp.num_attention_heads}")
+    print(f"    hidden_size: {gpt_cfg.hidden_size}")
+    print(f"    num_hidden_layers: {gpt_cfg.num_hidden_layers}")
+    print(f"    num_attention_heads: {gpt_cfg.num_attention_heads}")
     print(f"    vocab_size (speech): {hp.speech_tokens_dict_size}")
 
     print(f"\n  T3 components:")
