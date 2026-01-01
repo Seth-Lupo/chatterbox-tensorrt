@@ -288,7 +288,7 @@ class BatchCoordinator:
         self.running = True
 
         # Batching parameters
-        self.batch_wait_ms = 10  # Wait for more rails before processing
+        self.batch_wait_ms = 50  # Wait for more rails before processing (increased for better batching)
         self.max_batch_size = MAX_RAILS
 
         # Worker thread
@@ -359,7 +359,9 @@ class BatchCoordinator:
         # (temperature, etc. should be similar across rails)
         config = batch[0].config
 
-        logger.debug(f"Generating batch of {len(batch)} utterances: {[u.rail_name for u in batch]}")
+        logger.info(f"BATCH: Generating {len(batch)} utterances together: {[u.rail_name for u in batch]}")
+        for i, u in enumerate(batch):
+            logger.info(f"  [{i}] {u.rail_name}: '{u.text[:50]}...' ({len(u.text)} chars)")
 
         try:
             # Run batched generation

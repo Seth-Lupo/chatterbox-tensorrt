@@ -794,8 +794,8 @@ class ChatterboxTurboTTS:
             state.kv_cache = outputs.past_key_values
 
             # Build history tensor for repetition penalty
-            history = torch.cat(state.generated_tokens, dim=-1) if state.generated_tokens else last_token
-            history = history.unsqueeze(0) if history.dim() == 1 else history
+            # Stack all tokens into [1, N] shape for processors
+            history = torch.cat(state.generated_tokens, dim=1)  # [1, N] since each token is [1, 1]
 
             logits = self.t3.speech_head(outputs[0])
             logits = processors(history, logits[:, -1, :])

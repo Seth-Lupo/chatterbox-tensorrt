@@ -3,6 +3,7 @@ Test: True Parallel Generation with Batched Inference
 
 Demonstrates simultaneous audio generation across multiple rails.
 Both speakers generate audio AT THE SAME TIME, not interleaved.
+Outputs are layered into a single combined audio file.
 """
 
 import sys
@@ -10,10 +11,14 @@ sys.path.insert(0, "src")
 
 import time
 import threading
+import logging
 import numpy as np
 import torch
 from scipy.io import wavfile
 from chatterbox import TTSRails
+
+# Enable logging to see batch coordination
+logging.basicConfig(level=logging.INFO, format='%(name)s: %(message)s')
 
 
 def collect_audio(rail, name, results, timestamps):
@@ -35,6 +40,40 @@ def collect_audio(rail, name, results, timestamps):
 
     results[name] = chunks
     timestamps[name] = chunk_times
+
+
+def layer_audio(audio_dict, sample_rate=24000):
+    """Layer multiple audio tracks into a single mixed output."""
+    if not audio_dict:
+        return None
+
+    # Find max length
+    max_len = 0
+    audio_arrays = {}
+
+    for name, chunks in audio_dict.items():
+        if chunks:
+            audio = torch.cat(chunks, dim=-1).squeeze().cpu().numpy()
+            audio_arrays[name] = audio
+            max_len = max(max_len, len(audio))
+            print(f"  {name}: {len(audio)} samples ({len(audio)/sample_rate:.2f}s)")
+
+    if not audio_arrays:
+        return None
+
+    # Pad and mix
+    mixed = np.zeros(max_len, dtype=np.float32)
+    for name, audio in audio_arrays.items():
+        padded = np.zeros(max_len, dtype=np.float32)
+        padded[:len(audio)] = audio
+        mixed += padded
+
+    # Normalize to prevent clipping
+    max_val = np.max(np.abs(mixed))
+    if max_val > 0.95:
+        mixed = mixed * (0.95 / max_val)
+
+    return mixed
 
 
 def main():
@@ -63,16 +102,16 @@ def main():
     # Push text to BOTH rails simultaneously
     print("\n[4] Pushing text to both rails simultaneously...")
 
-    text_a = "Hello! I am speaker A. This is the first sentence. And here is a second one."
-    text_b = "Hi there! I am speaker B. Watch how we speak together. This is amazing."
+    # Using single sentences to ensure they get batched together
+    text_a = "Hello, I am speaker A and this is my complete sentence for testing parallel generation."
+    text_b = "Hi there, I am speaker B and this is my complete sentence for testing parallel generation."
 
     start_time = time.time()
 
-    # Push all text at once to both rails
-    for word in text_a.split():
-        rail_a.push(word + " ")
-    for word in text_b.split():
-        rail_b.push(word + " ")
+    # Push complete sentences to both rails at the same time
+    # This ensures they hit sentence boundaries together and get batched
+    rail_a.push(text_a)
+    rail_b.push(text_b)
 
     print(f"  Speaker A: {len(text_a)} chars")
     print(f"  Speaker B: {len(text_b)} chars")
@@ -110,15 +149,38 @@ def main():
         else:
             print("  => SEQUENTIAL: Rails generated one after the other")
 
-    # Save audio files
-    print("\n[7] Saving audio files...")
+    # Save individual audio files and validate
+    print("\n[7] Saving individual audio files...")
 
     for name, chunks in results.items():
         if chunks:
             audio = torch.cat(chunks, dim=-1).squeeze().cpu().numpy()
             filename = f"output_parallel_{name}.wav"
             wavfile.write(filename, 24000, (audio * 32767).astype(np.int16))
-            print(f"  Speaker {name}: {len(audio)/24000:.2f}s -> {filename}")
+
+            # Audio validation
+            duration = len(audio) / 24000
+            max_val = np.max(np.abs(audio))
+            mean_val = np.mean(np.abs(audio))
+            print(f"  Speaker {name}: {duration:.2f}s -> {filename}")
+            print(f"    - Max amplitude: {max_val:.4f}")
+            print(f"    - Mean amplitude: {mean_val:.4f}")
+            print(f"    - Chunks: {len(chunks)}")
+
+            # Check for potential issues
+            if duration < 1.0:
+                print(f"    - WARNING: Audio very short!")
+            if max_val > 0.99:
+                print(f"    - WARNING: Possible clipping!")
+            if mean_val < 0.01:
+                print(f"    - WARNING: Audio may be too quiet!")
+
+    # Layer audio into combined output
+    print("\n[8] Layering audio into combined output.wav...")
+    mixed = layer_audio(results)
+    if mixed is not None:
+        wavfile.write("output.wav", 24000, (mixed * 32767).astype(np.int16))
+        print(f"  Combined: {len(mixed)/24000:.2f}s -> output.wav")
 
     # Summary
     print(f"\n" + "=" * 70)
@@ -131,15 +193,23 @@ def main():
         audio_a = sum(c.shape[-1] for c in results["A"]) / 24000
         audio_b = sum(c.shape[-1] for c in results["B"]) / 24000
         total_audio = audio_a + audio_b
-        speedup = total_audio / total_time
 
+        print(f"  Speaker A audio: {audio_a:.2f}s")
+        print(f"  Speaker B audio: {audio_b:.2f}s")
         print(f"  Total audio generated: {total_audio:.2f}s")
-        print(f"  Real-time factor: {speedup:.2f}x (higher is better)")
 
-        if speedup > 1.5:
-            print("  => EFFICIENT PARALLEL: Generated more audio than wall time!")
+        if total_time > 0:
+            speedup = total_audio / total_time
+            print(f"  Real-time factor: {speedup:.2f}x (higher is better)")
+
+            if speedup > 1.5:
+                print("  => EFFICIENT PARALLEL: Generated more audio than wall time!")
 
     print("=" * 70)
+    print("\nOutput files:")
+    print("  - output_parallel_A.wav (Speaker A only)")
+    print("  - output_parallel_B.wav (Speaker B only)")
+    print("  - output.wav (Both speakers layered together)")
 
     tts.shutdown()
 
