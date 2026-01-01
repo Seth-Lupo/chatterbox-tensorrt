@@ -273,7 +273,7 @@ class ChatterboxTurboTTS:
         ckpt_dir,
         device,
         dtype: str = "float32",
-        compile_mode: Optional[str] = None,
+        compile_mode: Optional[str] = "default",
     ) -> 'ChatterboxTurboTTS':
         """
         Load model from local checkpoint.
@@ -282,7 +282,7 @@ class ChatterboxTurboTTS:
             ckpt_dir: Path to checkpoint directory
             device: Device to load model on ("cuda", "cpu", "mps")
             dtype: Data type ("float32", "float16", "bfloat16")
-            compile_mode: Compilation mode (None, "default", "reduce-overhead", "max-autotune", "tensorrt")
+            compile_mode: Compilation mode ("default" by default, None to disable, "reduce-overhead", "max-autotune", "tensorrt")
         """
         ckpt_dir = Path(ckpt_dir)
 
@@ -357,7 +357,7 @@ class ChatterboxTurboTTS:
         cls,
         device: str,
         dtype: str = "float32",
-        compile_mode: Optional[str] = None,
+        compile_mode: Optional[str] = "default",
     ) -> 'ChatterboxTurboTTS':
         """
         Load model from HuggingFace Hub.
@@ -368,9 +368,9 @@ class ChatterboxTurboTTS:
                 - "float32": Full precision (default, most accurate)
                 - "float16": Half precision (faster, slight quality loss)
                 - "bfloat16": Brain float16 (faster, better precision than fp16)
-            compile_mode: Optional compilation for faster inference
-                - None: No compilation (default)
-                - "default": Basic torch.compile
+            compile_mode: Compilation for faster inference
+                - "default": Basic torch.compile (default, recommended)
+                - None: No compilation (disable)
                 - "reduce-overhead": Good for streaming (small batches)
                 - "max-autotune": Slowest compile, fastest runtime
                 - "tensorrt": Use TensorRT (requires torch-tensorrt)
