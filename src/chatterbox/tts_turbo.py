@@ -13,7 +13,7 @@ import torchaudio
 
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, StaticCache
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -173,6 +173,27 @@ class ChatterboxTurboTTS:
 
         # Cached resamplers for GPU-accelerated audio processing
         self._resamplers = {}
+
+        # Static KV cache for faster autoregressive generation
+        self._static_cache = None
+        self._static_cache_max_len = 1500  # Max sequence: text + cond + speech tokens
+
+    def _get_or_create_static_cache(self, batch_size: int = 1) -> StaticCache:
+        """Get or create a static KV cache for faster generation."""
+        if self._static_cache is None:
+            self._static_cache = StaticCache(
+                config=self.t3.cfg,
+                batch_size=batch_size,
+                max_cache_len=self._static_cache_max_len,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        return self._static_cache
+
+    def _reset_static_cache(self):
+        """Reset the static cache for a new generation."""
+        if self._static_cache is not None:
+            self._static_cache.reset()
 
     def _get_resampler(self, src_sr: int, dst_sr: int) -> torchaudio.transforms.Resample:
         """Get or create a cached resampler for the given sample rates."""
@@ -720,10 +741,14 @@ class ChatterboxTurboTTS:
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
         max_gen_len: int = 1000,
+        use_static_cache: bool = True,
     ) -> Generator[torch.Tensor, None, None]:
         """
         Streaming version of inference_turbo that yields tokens one at a time.
         Optimized for minimal overhead per token.
+
+        Args:
+            use_static_cache: Use pre-allocated static KV cache for faster generation
         """
         # Get cached logits processors
         logits_processors = self._get_logits_processors(
@@ -745,9 +770,21 @@ class ChatterboxTurboTTS:
         )
         num_generated = 0
 
-        # Initial forward pass (includes full context)
-        llm_outputs = self.t3.tfmr(inputs_embeds=embeds, use_cache=True)
-        past_key_values = llm_outputs.past_key_values
+        # Setup KV cache - static cache enables CUDA graphs for faster generation
+        if use_static_cache:
+            static_cache = self._get_or_create_static_cache(batch_size=1)
+            static_cache.reset()
+            # Initial forward pass with static cache
+            llm_outputs = self.t3.tfmr(
+                inputs_embeds=embeds,
+                past_key_values=static_cache,
+                use_cache=True
+            )
+            past_key_values = static_cache  # Static cache updates in-place
+        else:
+            # Dynamic cache (original behavior)
+            llm_outputs = self.t3.tfmr(inputs_embeds=embeds, use_cache=True)
+            past_key_values = llm_outputs.past_key_values
 
         # Get first token
         speech_logits = self.t3.speech_head(llm_outputs[0][:, -1:])
