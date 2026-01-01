@@ -624,17 +624,15 @@ class ChatterboxTurboTTS:
 
         # Dynamic ramp-up schedule: [chunk_size, context_window, cfm_steps]
         # Starts tiny for fast TTFA, doubles tokens each chunk until 32
-        # CFM steps ramp from 1 to 10 for quality
         ramp_schedule = [
-            (2, 0, 1),         # Chunk 0: ultra-fast first chunk
-            (4, 2, 4),         # Chunk 1: doubling
-            (8, 6, 8),         # Chunk 2: doubling
-            (16, 14, 10),      # Chunk 3: doubling
-            (32, 30, 10),      # Chunk 4: doubling to max
-            (32, 62, 10),      # Chunk 5: steady state
-            (32, 125, 10),     # Chunk 6
-            (32, 250, 10),     # Chunk 7
-            (32, context_window, 10),  # Chunk 8+: full (500)
+            (4, 0, 1),         # Chunk 0: ultra-fast first chunk
+            (8, 4, 2),         # Chunk 1: doubling
+            (16, 12, 3),       # Chunk 2: doubling
+            (32, 28, 4),       # Chunk 3: doubling to max
+            (32, 60, cfm_steps),    # Chunk 4+: steady state
+            (32, 120, cfm_steps),   # Chunk 5
+            (32, 250, cfm_steps),   # Chunk 6
+            (32, context_window, cfm_steps),  # Chunk 7+: full (500)
         ]
 
         # Stream tokens from T3
