@@ -229,26 +229,18 @@ class ChatterboxTurboTTS:
                 logger.warning(f"TensorRT compilation failed: {e}, falling back to torch.compile")
                 mode = "default"
 
-        if mode not in ["tensorrt", "static-tensorrt", "static-cudagraphs"]:
-            # NOTE: "reduce-overhead" uses CUDA graphs which don't work with
-            # autoregressive generation (dynamic shapes, tensor reuse issues).
-            # Use "default" mode for streaming/autoregressive workloads.
-            compile_kwargs = {"dynamic": True}  # Handle varying input sizes without recompilation
-            if mode == "reduce-overhead":
-                logger.warning("reduce-overhead mode may cause issues with streaming generation")
-                compile_kwargs["mode"] = "reduce-overhead"
-            elif mode == "max-autotune":
+        if mode not in ["tensorrt"]:
+            # Only compile S3Gen flow - T3 autoregressive generation doesn't benefit
+            # from torch.compile due to dynamic shapes and CUDA graph incompatibility
+            compile_kwargs = {}
+            if mode == "max-autotune":
                 compile_kwargs["mode"] = "max-autotune"
-            # "default" mode uses no special options (just dynamic=True)
 
-            # Compile T3 transformer
-            self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
-            # Compile speech embedding and head
-            self.t3.speech_emb = torch.compile(self.t3.speech_emb, **compile_kwargs)
-            self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
-            # Compile S3Gen flow model
+            # Only compile S3Gen flow (non-autoregressive, benefits from compilation)
             self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-            logger.info(f"Models compiled with torch.compile (mode={mode or 'default'}, dynamic=True)")
+            logger.info(f"S3Gen flow compiled with torch.compile (mode={mode or 'default'})")
+            # Note: T3 transformer NOT compiled - autoregressive generation has
+            # dynamic shapes that cause CUDA graph errors with torch.compile
 
         self._compiled = True
 
@@ -498,17 +490,22 @@ class ChatterboxTurboTTS:
         wav = wav.squeeze(0).detach().cpu()
         return wav.unsqueeze(0)
 
-    def _process_token_chunk(
+    def _process_token_chunk_ola(
         self,
         new_tokens: torch.Tensor,
         all_tokens_so_far: torch.Tensor,
         context_window: int,
         start_time: float,
         metrics: StreamingMetrics,
-        fade_in_duration: float = 0.02,
-        fade_out_duration: float = 0.02,
-    ) -> Tuple[Optional[torch.Tensor], float, bool]:
-        """Process a chunk of tokens and return audio."""
+        prev_chunk_tail: Optional[np.ndarray],
+        overlap_samples: int = 1200,  # 50ms at 24kHz
+    ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
+        """
+        Process a chunk of tokens with Overlap-Add (OLA) for seamless blending.
+
+        Uses Hann windowing on overlap regions for smooth transitions without clicks.
+        Returns: (audio_tensor, duration, success, new_tail_for_next_chunk)
+        """
         # Build tokens_to_process by including context window
         if len(all_tokens_so_far) > 0:
             context_tokens = (
@@ -525,7 +522,7 @@ class ChatterboxTurboTTS:
         # Filter invalid tokens
         tokens_to_process = tokens_to_process[tokens_to_process < 6561]
         if len(tokens_to_process) == 0:
-            return None, 0.0, False
+            return None, 0.0, False, prev_chunk_tail
 
         tokens_to_process = tokens_to_process.to(self.device)
 
@@ -546,34 +543,59 @@ class ChatterboxTurboTTS:
             audio_chunk = wav
 
         if len(audio_chunk) == 0:
-            return None, 0.0, False
+            return None, 0.0, False, prev_chunk_tail
 
-        # Apply smooth crossfade to reduce glitching at chunk boundaries
-        # Separate fade-in and fade-out to avoid tremolo on short chunks
-        fade_in_samples = int(fade_in_duration * self.sr)
-        fade_out_samples = int(fade_out_duration * self.sr)
+        # ============================================================
+        # Overlap-Add (OLA) with Hann windowing for seamless blending
+        # ============================================================
 
-        # Only apply fades if they fit within the chunk
-        if fade_in_samples > 0 and fade_in_samples < len(audio_chunk) // 2:
-            t = np.linspace(0.0, np.pi / 2, fade_in_samples, dtype=audio_chunk.dtype)
-            fade_in = np.sin(t)  # 0 -> 1 smoothly
-            audio_chunk[:fade_in_samples] *= fade_in
+        # Adjust overlap based on chunk size (smaller chunks = smaller overlap)
+        actual_overlap = min(overlap_samples, len(audio_chunk) // 3)
 
-        if fade_out_samples > 0 and fade_out_samples < len(audio_chunk) // 2:
-            t = np.linspace(0.0, np.pi / 2, fade_out_samples, dtype=audio_chunk.dtype)
-            fade_out = np.cos(t)  # 1 -> 0 smoothly
-            audio_chunk[-fade_out_samples:] *= fade_out
+        if prev_chunk_tail is not None and actual_overlap > 0:
+            # Create Hann window for smooth crossfade
+            # Hann window: w(n) = 0.5 * (1 - cos(2*pi*n/(N-1)))
+            hann = np.hanning(actual_overlap * 2).astype(audio_chunk.dtype)
+            fade_out = hann[:actual_overlap]  # First half: 0 -> 1 -> ~0.5
+            fade_in = hann[actual_overlap:]   # Second half: ~0.5 -> 1 -> 0
+
+            # Actually we want complementary fades that sum to 1
+            # fade_out: 1 -> 0, fade_in: 0 -> 1
+            fade_out = np.sqrt(0.5 * (1 + np.cos(np.linspace(0, np.pi, actual_overlap)))).astype(audio_chunk.dtype)
+            fade_in = np.sqrt(0.5 * (1 - np.cos(np.linspace(0, np.pi, actual_overlap)))).astype(audio_chunk.dtype)
+
+            # Ensure prev_chunk_tail has enough samples
+            tail_len = len(prev_chunk_tail)
+            if tail_len >= actual_overlap:
+                # Blend: apply fade_out to tail, fade_in to head, then add
+                blended_region = (
+                    prev_chunk_tail[-actual_overlap:] * fade_out +
+                    audio_chunk[:actual_overlap] * fade_in
+                )
+                # Build output: blended region + rest of current chunk
+                audio_chunk = np.concatenate([blended_region, audio_chunk[actual_overlap:]])
+            else:
+                # Not enough tail, just do simple crossfade with what we have
+                blend_len = min(tail_len, actual_overlap, len(audio_chunk))
+                if blend_len > 0:
+                    fade_out_short = np.sqrt(0.5 * (1 + np.cos(np.linspace(0, np.pi, blend_len)))).astype(audio_chunk.dtype)
+                    fade_in_short = np.sqrt(0.5 * (1 - np.cos(np.linspace(0, np.pi, blend_len)))).astype(audio_chunk.dtype)
+                    blended = prev_chunk_tail[-blend_len:] * fade_out_short + audio_chunk[:blend_len] * fade_in_short
+                    audio_chunk = np.concatenate([blended, audio_chunk[blend_len:]])
+
+        # Save tail for next chunk's overlap-add
+        new_tail = audio_chunk[-overlap_samples:].copy() if len(audio_chunk) >= overlap_samples else audio_chunk.copy()
 
         # Compute audio duration
         audio_duration = len(audio_chunk) / self.sr
-        audio_tensor = torch.from_numpy(audio_chunk).unsqueeze(0)
+        audio_tensor = torch.from_numpy(audio_chunk.copy()).unsqueeze(0)
 
         # Update first-chunk latency metric
         if metrics.chunk_count == 0:
             metrics.latency_to_first_chunk = time.time() - start_time
 
         metrics.chunk_count += 1
-        return audio_tensor, audio_duration, True
+        return audio_tensor, audio_duration, True, new_tail
 
     def generate_stream(
         self,
@@ -586,12 +608,13 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
         context_window: int = 200,
-        fade_duration: float = 0.05,
+        overlap_ms: float = 50.0,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
 
-        Uses dynamic chunk sizing: starts small for fast TTFA, ramps up for quality.
+        Uses dynamic chunk sizing and Overlap-Add (OLA) with Hann windowing
+        for seamless audio blending without clicks or choppiness.
 
         Args:
             text: Input text to synthesize
@@ -602,8 +625,8 @@ class ChatterboxTurboTTS:
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty
             chunk_size: Target tokens for chunks after ramp-up (default 25)
-            context_window: Max context tokens for audio coherence (default 50)
-            fade_duration: Seconds for crossfade smoothing (default 50ms)
+            context_window: Max context tokens for audio coherence (default 200)
+            overlap_ms: Overlap duration in ms for OLA blending (default 50ms)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
@@ -625,18 +648,22 @@ class ChatterboxTurboTTS:
         all_tokens = torch.tensor([], dtype=torch.long, device=self.device)
         chunk_buffer = []
 
-        # Dynamic ramp-up schedule: [chunk_size, context_window, fade_in, fade_out]
+        # Overlap-Add state
+        prev_chunk_tail: Optional[np.ndarray] = None
+        overlap_samples = int(overlap_ms * self.sr / 1000)  # Convert ms to samples
+
+        # Dynamic ramp-up schedule: [chunk_size, context_window, overlap_samples]
         # Starts small for fast TTFA, gradually increases for better quality
-        # Early chunks: no/minimal fade to avoid tremolo on short audio
+        # Early chunks use smaller overlap to avoid artifacts on short audio
         ramp_schedule = [
-            (10, 0, 0.0, 0.0),       # Chunk 0: small but complete phrase, no fade
-            (15, 10, 0.01, 0.0),     # Chunk 1: growing, tiny fade-in only
-            (20, 25, 0.02, 0.01),    # Chunk 2: gentle crossfade
-            (chunk_size, 45, 0.03, 0.02),   # Chunk 3: building up
-            (chunk_size, 70, 0.04, 0.03),   # Chunk 4
-            (chunk_size, 100, 0.05, 0.04),  # Chunk 5
-            (chunk_size, 150, fade_duration, fade_duration),  # Chunk 6
-            (chunk_size, context_window, fade_duration, fade_duration),  # Chunk 7+: full (200)
+            (10, 0, overlap_samples // 4),      # Chunk 0: minimal overlap
+            (15, 10, overlap_samples // 3),     # Chunk 1: growing
+            (20, 25, overlap_samples // 2),     # Chunk 2: building
+            (chunk_size, 45, overlap_samples * 2 // 3),   # Chunk 3
+            (chunk_size, 70, overlap_samples * 3 // 4),   # Chunk 4
+            (chunk_size, 100, overlap_samples),           # Chunk 5: full overlap
+            (chunk_size, 150, overlap_samples),           # Chunk 6
+            (chunk_size, context_window, overlap_samples),  # Chunk 7+: full
         ]
 
         # Stream tokens from T3
@@ -653,15 +680,15 @@ class ChatterboxTurboTTS:
 
                 # Get dynamic parameters based on chunk count (ramp up over time)
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                current_chunk_size, current_context, fade_in, fade_out = ramp_schedule[schedule_idx]
+                current_chunk_size, current_context, current_overlap = ramp_schedule[schedule_idx]
 
                 # When we have enough tokens, process and yield audio
                 if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
 
-                    audio_tensor, audio_duration, success = self._process_token_chunk(
+                    audio_tensor, audio_duration, success, prev_chunk_tail = self._process_token_chunk_ola(
                         new_tokens, all_tokens, current_context, start_time, metrics,
-                        fade_in_duration=fade_in, fade_out_duration=fade_out
+                        prev_chunk_tail, overlap_samples=current_overlap
                     )
 
                     if success:
@@ -677,11 +704,11 @@ class ChatterboxTurboTTS:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
                 # Use current schedule for final chunk
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                _, current_context, fade_in, fade_out = ramp_schedule[schedule_idx]
+                _, current_context, current_overlap = ramp_schedule[schedule_idx]
 
-                audio_tensor, audio_duration, success = self._process_token_chunk(
+                audio_tensor, audio_duration, success, _ = self._process_token_chunk_ola(
                     new_tokens, all_tokens, current_context, start_time, metrics,
-                    fade_in_duration=fade_in, fade_out_duration=fade_out
+                    prev_chunk_tail, overlap_samples=current_overlap
                 )
 
                 if success:
