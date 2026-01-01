@@ -574,13 +574,14 @@ class ChatterboxTurboTTS:
         top_k: int = 1000,
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
-        first_chunk_size: int = 5,
         chunk_size: int = 25,
         context_window: int = 50,
         fade_duration: float = 0.05,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
+
+        Uses dynamic chunk sizing: starts small for fast TTFA, ramps up for quality.
 
         Args:
             text: Input text to synthesize
@@ -590,10 +591,9 @@ class ChatterboxTurboTTS:
             top_k: Top-k sampling parameter
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty
-            first_chunk_size: Tokens for first chunk (smaller = faster TTFA)
-            chunk_size: Tokens for subsequent chunks (larger = more efficient)
-            context_window: Number of previous tokens to include for audio coherence
-            fade_duration: Seconds for crossfade smoothing at chunk boundaries (default 50ms)
+            chunk_size: Target tokens for chunks after ramp-up (default 25)
+            context_window: Max context tokens for audio coherence (default 50)
+            fade_duration: Seconds for crossfade smoothing (default 50ms)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
@@ -615,6 +615,16 @@ class ChatterboxTurboTTS:
         all_tokens = torch.tensor([], dtype=torch.long, device=self.device)
         chunk_buffer = []
 
+        # Dynamic ramp-up schedule: [chunk_size, context_window, fade_duration]
+        # Starts small for fast TTFA, gradually increases for better quality
+        ramp_schedule = [
+            (8, 0, 0.03),      # Chunk 0: tiny, no context, short fade (fast TTFA)
+            (12, 8, 0.04),     # Chunk 1: small, minimal context
+            (18, 20, 0.05),    # Chunk 2: medium, growing context
+            (chunk_size, 35, fade_duration),  # Chunk 3: larger
+            (chunk_size, context_window, fade_duration),  # Chunk 4+: full params
+        ]
+
         # Stream tokens from T3
         with torch.inference_mode():
             for token in self._inference_stream_turbo(
@@ -627,15 +637,16 @@ class ChatterboxTurboTTS:
             ):
                 chunk_buffer.append(token)
 
-                # Dynamic chunk size: small first chunk for fast TTFA, larger chunks after
-                current_chunk_size = first_chunk_size if metrics.chunk_count == 0 else chunk_size
+                # Get dynamic parameters based on chunk count (ramp up over time)
+                schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
+                current_chunk_size, current_context, current_fade = ramp_schedule[schedule_idx]
 
                 # When we have enough tokens, process and yield audio
                 if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
 
                     audio_tensor, audio_duration, success = self._process_token_chunk(
-                        new_tokens, all_tokens, context_window, start_time, metrics, fade_duration
+                        new_tokens, all_tokens, current_context, start_time, metrics, current_fade
                     )
 
                     if success:
@@ -649,9 +660,12 @@ class ChatterboxTurboTTS:
             # Process remaining tokens in buffer
             if chunk_buffer:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
+                # Use full context/fade for final chunk
+                schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
+                _, current_context, current_fade = ramp_schedule[schedule_idx]
 
                 audio_tensor, audio_duration, success = self._process_token_chunk(
-                    new_tokens, all_tokens, context_window, start_time, metrics, fade_duration
+                    new_tokens, all_tokens, current_context, start_time, metrics, current_fade
                 )
 
                 if success:
