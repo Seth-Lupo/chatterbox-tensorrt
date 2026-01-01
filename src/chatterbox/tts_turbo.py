@@ -574,6 +574,7 @@ class ChatterboxTurboTTS:
         top_k: int = 1000,
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
+        first_chunk_size: int = 12,
         chunk_size: int = 25,
         context_window: int = 50,
         fade_duration: float = 0.05,
@@ -589,7 +590,8 @@ class ChatterboxTurboTTS:
             top_k: Top-k sampling parameter
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty
-            chunk_size: Number of speech tokens per chunk
+            first_chunk_size: Tokens for first chunk (smaller = faster TTFA)
+            chunk_size: Tokens for subsequent chunks (larger = more efficient)
             context_window: Number of previous tokens to include for audio coherence
             fade_duration: Seconds for crossfade smoothing at chunk boundaries (default 50ms)
 
@@ -625,8 +627,11 @@ class ChatterboxTurboTTS:
             ):
                 chunk_buffer.append(token)
 
+                # Dynamic chunk size: small first chunk for fast TTFA, larger chunks after
+                current_chunk_size = first_chunk_size if metrics.chunk_count == 0 else chunk_size
+
                 # When we have enough tokens, process and yield audio
-                if len(chunk_buffer) >= chunk_size:
+                if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
 
                     audio_tensor, audio_duration, success = self._process_token_chunk(
