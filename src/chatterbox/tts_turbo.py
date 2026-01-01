@@ -622,17 +622,17 @@ class ChatterboxTurboTTS:
         chunk_buffer = []
         prev_tail: Optional[np.ndarray] = None
 
-        # Dynamic ramp-up schedule: [chunk_size, context_window]
-        # Starts small for fast TTFA, gradually increases for better quality
+        # Dynamic ramp-up schedule: [chunk_size, context_window, cfm_steps]
+        # Starts tiny for fast TTFA, doubles tokens each chunk until 32
         ramp_schedule = [
-            (10, 0),        # Chunk 0: fast first chunk
-            (15, 10),       # Chunk 1: growing
-            (20, 25),       # Chunk 2: building
-            (chunk_size, 50),    # Chunk 3
-            (chunk_size, 100),   # Chunk 4
-            (chunk_size, 200),   # Chunk 5
-            (chunk_size, 350),   # Chunk 6
-            (chunk_size, context_window),  # Chunk 7+: full (500)
+            (4, 0, 1),         # Chunk 0: ultra-fast first chunk
+            (8, 4, 2),         # Chunk 1: doubling
+            (16, 12, 3),       # Chunk 2: doubling
+            (32, 28, 4),       # Chunk 3: doubling to max
+            (32, 60, cfm_steps),    # Chunk 4+: steady state
+            (32, 120, cfm_steps),   # Chunk 5
+            (32, 250, cfm_steps),   # Chunk 6
+            (32, context_window, cfm_steps),  # Chunk 7+: full (500)
         ]
 
         # Stream tokens from T3
@@ -649,7 +649,7 @@ class ChatterboxTurboTTS:
 
                 # Get dynamic parameters based on chunk count (ramp up over time)
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                current_chunk_size, current_context = ramp_schedule[schedule_idx]
+                current_chunk_size, current_context, current_cfm = ramp_schedule[schedule_idx]
 
                 # When we have enough tokens, process and yield audio
                 if len(chunk_buffer) >= current_chunk_size:
@@ -657,7 +657,7 @@ class ChatterboxTurboTTS:
 
                     audio_tensor, audio_duration, success, prev_tail = self._process_token_chunk(
                         new_tokens, all_tokens, current_context, start_time, metrics,
-                        prev_tail, crossfade_ms, cfm_steps
+                        prev_tail, crossfade_ms, current_cfm
                     )
 
                     if success:
@@ -673,11 +673,11 @@ class ChatterboxTurboTTS:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
                 # Use current schedule for final chunk
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                _, current_context = ramp_schedule[schedule_idx]
+                _, current_context, current_cfm = ramp_schedule[schedule_idx]
 
                 audio_tensor, audio_duration, success, _ = self._process_token_chunk(
                     new_tokens, all_tokens, current_context, start_time, metrics,
-                    prev_tail, crossfade_ms, cfm_steps
+                    prev_tail, crossfade_ms, current_cfm
                 )
 
                 if success:
