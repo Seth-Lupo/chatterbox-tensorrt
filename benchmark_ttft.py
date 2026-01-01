@@ -106,8 +106,17 @@ def main():
     print("Loading model (T3 on CPU)...")
     model = ChatterboxTurboTTS.from_pretrained(device="cpu")
 
+    # Prepare conditionals while still on CPU
+    print("Preparing conditionals...")
+    model.prepare_conditionals(args.voice, exaggeration=0.5)
+
     print("Moving S3Gen to GPU...")
     model.s3gen = model.s3gen.to("cuda")
+
+    # Move S3Gen conditioning to GPU
+    for k, v in model.conds.gen.items():
+        if torch.is_tensor(v):
+            model.conds.gen[k] = v.to("cuda")
 
     print("Compiling S3Gen...")
     model.s3gen.flow = torch.compile(model.s3gen.flow)
@@ -115,7 +124,6 @@ def main():
 
     # Warmup
     print("Warming up...")
-    model.prepare_conditionals(args.voice, exaggeration=0.5)
     for _ in model.generate_stream("Hello.", ramp_schedule=[(4, 0, 1)]):
         break
     print("Warmup complete")

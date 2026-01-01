@@ -559,9 +559,10 @@ class ChatterboxTurboTTS:
         if len(tokens) == 0:
             return None, 0.0, False, prev_tail
 
-        # Generate audio
+        # Generate audio (use S3Gen's actual device, not self.device)
+        s3gen_device = next(self.s3gen.parameters()).device
         wav, _ = self.s3gen.inference(
-            speech_tokens=tokens.to(self.device),
+            speech_tokens=tokens.to(s3gen_device),
             ref_dict=self.conds.gen,
             n_cfm_timesteps=cfm_steps,
         )
@@ -848,9 +849,10 @@ class ChatterboxTurboTTS:
         if len(tokens) == 0:
             return None
 
-        # Generate audio using this state's conditioning
+        # Generate audio using this state's conditioning (use S3Gen's actual device)
+        s3gen_device = next(self.s3gen.parameters()).device
         wav, _ = self.s3gen.inference(
-            speech_tokens=tokens.to(self.device),
+            speech_tokens=tokens.to(s3gen_device),
             ref_dict=state.conds.gen,
             n_cfm_timesteps=cfm_steps,
         )
