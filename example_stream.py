@@ -17,8 +17,9 @@ import sys
 sys.path.insert(0, "/Users/sethlupo/Public/new-bot/martha/src")
 
 import argparse
+import numpy as np
 import torch
-import torchaudio as ta
+from scipy.io import wavfile
 from chatterbox import ChatterboxTurboTTS
 
 
@@ -92,7 +93,9 @@ def main():
         print(f"Real-time factor: {metrics.rtf:.3f} {'(real-time capable!)' if metrics.rtf < 1.0 else ''}")
 
     # Save output
-    ta.save(args.output, final_audio, model.sr)
+    audio_np = final_audio.squeeze().cpu().numpy()
+    audio_int16 = (audio_np * 32767).astype(np.int16)
+    wavfile.write(args.output, model.sr, audio_int16)
     print(f"Saved to {args.output}")
 
 

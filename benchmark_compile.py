@@ -16,8 +16,9 @@ import statistics
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
-import torchaudio
+from scipy.io import wavfile
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -101,7 +102,7 @@ def run_benchmark(model, name: str, iterations: int, audio_prompt_path: str = No
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark optimized Chatterbox Turbo")
-    parser.add_argument("--iterations", type=int, default=10, help="Number of test iterations")
+    parser.add_argument("--iterations", type=int, default=5, help="Number of test iterations")
     parser.add_argument("--audio_prompt", type=str, default=None, help="Reference audio for voice cloning")
     parser.add_argument("--compile_mode", type=str, default="tensorrt",
                         choices=["tensorrt", "default", "max-autotune"],
@@ -199,7 +200,10 @@ def main():
         audio_chunks.append(chunk)
 
     final_audio = torch.cat(audio_chunks, dim=-1)
-    torchaudio.save(args.output, final_audio, model.sr)
+    # Convert to int16 for wav file
+    audio_np = final_audio.squeeze().cpu().numpy()
+    audio_int16 = (audio_np * 32767).astype(np.int16)
+    wavfile.write(args.output, model.sr, audio_int16)
     print(f"Saved to {args.output}")
 
 
