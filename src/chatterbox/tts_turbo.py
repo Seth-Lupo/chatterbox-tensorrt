@@ -168,17 +168,17 @@ class ChatterboxTurboTTS:
         # Pre-create logits processors (avoid recreating each call)
         self._logits_processors_cache = {}
 
-    def compile_models(self, mode: str = "default"):
+    def compile_models(self, mode: str = "tensorrt"):
         """
-        Compile S3Gen model for faster inference.
+        Compile S3Gen model for faster inference using TensorRT by default.
         T3 is kept as default (uncompiled) for stability.
 
         Args:
             mode: Compilation mode
+                - "tensorrt": TensorRT backend (default, requires torch-tensorrt)
                 - "default": torch.compile with default settings
                 - "reduce-overhead": Optimized for small batches (good for streaming)
                 - "max-autotune": Maximum optimization (slower compile, faster run)
-                - "tensorrt": Use TensorRT backend (requires torch-tensorrt)
         """
         if self._compiled:
             logger.warning("Models already compiled, skipping")
@@ -186,15 +186,28 @@ class ChatterboxTurboTTS:
 
         logger.info(f"Compiling S3Gen with mode: {mode} (T3 kept as default)")
 
-        # Use dynamic=True to avoid recompilation on different input shapes
-        compile_kwargs = {"dynamic": True}
-
-        if mode == "max-autotune":
-            compile_kwargs["mode"] = "max-autotune"
-
-        # Only compile S3Gen flow model - keep T3 as default for stability
-        self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-        logger.info(f"S3Gen compiled with torch.compile (dynamic=True, mode={mode})")
+        if mode == "tensorrt":
+            import torch_tensorrt
+            self.s3gen.flow = torch.compile(
+                self.s3gen.flow,
+                backend="torch_tensorrt",
+                options={
+                    "truncate_long_and_double": True,
+                    "enabled_precisions": {torch.float16, torch.float32},
+                    "debug": False,
+                    "min_block_size": 1,
+                    "use_python_runtime": False,
+                }
+            )
+            logger.info("S3Gen compiled with TensorRT backend")
+        else:
+            compile_kwargs = {"dynamic": True}
+            if mode == "max-autotune":
+                compile_kwargs["mode"] = "max-autotune"
+            elif mode == "reduce-overhead":
+                compile_kwargs["mode"] = "reduce-overhead"
+            self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
+            logger.info(f"S3Gen compiled with torch.compile (mode={mode})")
 
         self._compiled = True
 

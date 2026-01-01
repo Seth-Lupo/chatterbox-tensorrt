@@ -154,9 +154,9 @@ def main():
         help="Model precision"
     )
     parser.add_argument(
-        "--compile-mode", type=str, default="default",
-        choices=["none", "default", "reduce-overhead", "max-autotune", "tensorrt"],
-        help="Compilation mode for S3Gen (default: default)"
+        "--compile-mode", type=str, default="tensorrt",
+        choices=["none", "tensorrt", "default", "reduce-overhead", "max-autotune"],
+        help="Compilation mode for S3Gen (default: tensorrt)"
     )
     parser.add_argument(
         "--warmup", type=int, default=3,
