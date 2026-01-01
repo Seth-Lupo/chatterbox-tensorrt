@@ -539,11 +539,17 @@ class ChatterboxTurboTTS:
         if len(audio_chunk) == 0:
             return None, 0.0, False
 
-        # Apply fade-in to smooth chunk boundaries
+        # Apply smooth crossfade to reduce glitching at chunk boundaries
         fade_samples = int(fade_duration * self.sr)
-        if fade_samples > 0 and fade_samples < len(audio_chunk):
-            fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=audio_chunk.dtype)
+        if fade_samples > 0 and fade_samples < len(audio_chunk) // 2:
+            # Use cosine curve for smoother transitions (less audible than linear)
+            t = np.linspace(0.0, np.pi / 2, fade_samples, dtype=audio_chunk.dtype)
+            fade_in = np.sin(t)  # 0 -> 1 smoothly
+            fade_out = np.cos(t)  # 1 -> 0 smoothly
+
+            # Apply fade-in at start and fade-out at end
             audio_chunk[:fade_samples] *= fade_in
+            audio_chunk[-fade_samples:] *= fade_out
 
         # Compute audio duration
         audio_duration = len(audio_chunk) / self.sr
@@ -567,7 +573,7 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
         context_window: int = 50,
-        fade_duration: float = 0.02,
+        fade_duration: float = 0.05,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
@@ -582,7 +588,7 @@ class ChatterboxTurboTTS:
             repetition_penalty: Repetition penalty
             chunk_size: Number of speech tokens per chunk
             context_window: Number of previous tokens to include for audio coherence
-            fade_duration: Seconds to apply linear fade-in on each chunk
+            fade_duration: Seconds for crossfade smoothing at chunk boundaries (default 50ms)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
