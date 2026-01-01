@@ -48,6 +48,8 @@ class RailConfig:
     top_k: int = 1000
     top_p: float = 0.95
     repetition_penalty: float = 1.2
+    # Buffering: wait for sentence end OR this many ms of silence before generating
+    flush_timeout_ms: float = 300.0
 
 
 class Rail:
@@ -76,6 +78,7 @@ class Rail:
         # State
         self.state = RailState.IDLE
         self.pending_text = ""
+        self.last_push_time = 0.0
         self._lock = threading.Lock()
 
         # Control flags
@@ -96,12 +99,13 @@ class Rail:
         """
         Push text to be spoken. Non-blocking.
 
-        If currently generating, text is appended to the current utterance.
-        If idle, generation starts immediately.
+        Text is buffered until a sentence boundary or timeout, then
+        generated as a single utterance for optimal quality ramping.
         """
         if not text:
             return
         self.text_queue.put(text)
+        self.last_push_time = time.time()
 
     def read(self, timeout: Optional[float] = None) -> Optional[torch.Tensor]:
         """
@@ -146,9 +150,9 @@ class Rail:
         self.interrupt_flag.clear()
 
     def flush(self):
-        """Force generation of any buffered text."""
-        # Just a hint - the worker will pick it up
-        pass
+        """Force generation of any buffered text immediately."""
+        # Set last_push_time to 0 to trigger timeout condition
+        self.last_push_time = 0
 
     def close(self):
         """Shutdown this rail."""
@@ -189,17 +193,27 @@ class Rail:
         # Collect any pending text
         self._collect_text()
 
-        # Check if we have text to generate
         with self._lock:
-            text_to_generate = self.pending_text
-            if text_to_generate:
-                self.pending_text = ""
+            text = self.pending_text
+            if not text:
+                time.sleep(0.01)
+                return
 
-        if text_to_generate:
-            self._generate(text_to_generate)
-        else:
-            # Nothing to do, sleep briefly
-            time.sleep(0.01)
+            # Check if we should generate now:
+            # 1. Sentence boundary reached (. ! ?)
+            # 2. OR timeout since last push
+            sentence_end = text.rstrip().endswith(('.', '!', '?'))
+            time_since_push = (time.time() - self.last_push_time) * 1000  # ms
+            timeout_reached = time_since_push >= self.config.flush_timeout_ms
+
+            if sentence_end or timeout_reached:
+                self.pending_text = ""
+            else:
+                # Keep buffering
+                time.sleep(0.01)
+                return
+
+        self._generate(text)
 
     def _collect_text(self):
         """Drain text queue into pending buffer."""
@@ -212,7 +226,17 @@ class Rail:
                 break
 
     def _generate(self, text: str):
-        """Run TTS generation with GPU lock."""
+        """
+        Run TTS generation with GPU lock.
+
+        Note: GPU lock is held for entire utterance because:
+        1. Generator holds KV cache state between yields
+        2. model.conds must not be changed mid-generation
+
+        For parallel rails, they will queue and run sequentially.
+        Each rail's sentences are buffered, so the interleaving happens
+        at sentence boundaries rather than chunk boundaries.
+        """
         self.state = RailState.GENERATING
 
         # Load voice conditionals
@@ -223,55 +247,27 @@ class Rail:
             self.conds = None
 
         try:
-            # Acquire GPU lock
             with self.tts.gpu_lock:
                 if self.interrupt_flag.is_set():
                     return
 
-                # Set voice conditionals on model
                 if self.conds is not None:
                     self.tts.model.conds = self.conds
 
-                # Generate with streaming
                 for chunk, _ in self.tts.model.generate_stream(
                     text=text,
-                    audio_prompt_path=None,  # Using pre-loaded conds
+                    audio_prompt_path=None,
                     exaggeration=self.config.exaggeration,
                     temperature=self.config.temperature,
                     top_k=self.config.top_k,
                     top_p=self.config.top_p,
                     repetition_penalty=self.config.repetition_penalty,
                 ):
-                    # Check for interrupt
                     if self.interrupt_flag.is_set():
                         logger.debug(f"Rail '{self.name}' generation interrupted")
-                        break
+                        return
 
-                    # Emit audio
                     self.audio_queue.put(chunk)
-
-                    # Check for more text mid-generation (append to utterance)
-                    self._collect_text()
-
-                    with self._lock:
-                        if self.pending_text:
-                            # More text arrived - continue generating
-                            text = self.pending_text
-                            self.pending_text = ""
-                            # We'll loop back naturally since we're in the same generate call
-                            # Actually, we need to handle this differently...
-
-                # Check if more text arrived during generation
-                self._collect_text()
-                with self._lock:
-                    if self.pending_text and not self.interrupt_flag.is_set():
-                        # Recursively generate the new text
-                        # This keeps us in the GPU lock, which is intentional
-                        new_text = self.pending_text
-                        self.pending_text = ""
-                        # Release lock, re-acquire for next generation
-                        # Actually let's just set it so the next tick picks it up
-                        self.pending_text = new_text
 
         finally:
             self.state = RailState.IDLE
