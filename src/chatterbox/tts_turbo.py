@@ -560,13 +560,11 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
         context_window: int = 500,
-        overlap_ms: float = 50.0,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
 
-        Uses dynamic chunk sizing and Overlap-Add (OLA) with Hann windowing
-        for seamless audio blending without clicks or choppiness.
+        Uses dynamic chunk sizing for fast TTFA while ramping up context for quality.
 
         Args:
             text: Input text to synthesize
@@ -577,8 +575,7 @@ class ChatterboxTurboTTS:
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty
             chunk_size: Target tokens for chunks after ramp-up (default 25)
-            context_window: Max context tokens for audio coherence (default 200)
-            overlap_ms: Overlap duration in ms for OLA blending (default 50ms)
+            context_window: Max context tokens for audio coherence (default 500)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
@@ -600,22 +597,17 @@ class ChatterboxTurboTTS:
         all_tokens = torch.tensor([], dtype=torch.long, device=self.device)
         chunk_buffer = []
 
-        # Overlap-Add state
-        prev_chunk_tail: Optional[np.ndarray] = None
-        overlap_samples = int(overlap_ms * self.sr / 1000)  # Convert ms to samples
-
-        # Dynamic ramp-up schedule: [chunk_size, context_window, overlap_samples]
+        # Dynamic ramp-up schedule: [chunk_size, context_window]
         # Starts small for fast TTFA, gradually increases for better quality
-        # Early chunks use smaller overlap to avoid artifacts on short audio
         ramp_schedule = [
-            (10, 0, overlap_samples // 4),      # Chunk 0: minimal overlap
-            (15, 10, overlap_samples // 3),     # Chunk 1: growing
-            (20, 25, overlap_samples // 2),     # Chunk 2: building
-            (chunk_size, 50, overlap_samples * 2 // 3),   # Chunk 3
-            (chunk_size, 100, overlap_samples * 3 // 4),  # Chunk 4
-            (chunk_size, 200, overlap_samples),           # Chunk 5
-            (chunk_size, 350, overlap_samples),           # Chunk 6
-            (chunk_size, context_window, overlap_samples),  # Chunk 7+: full (500)
+            (10, 0),        # Chunk 0: fast first chunk
+            (15, 10),       # Chunk 1: growing
+            (20, 25),       # Chunk 2: building
+            (chunk_size, 50),    # Chunk 3
+            (chunk_size, 100),   # Chunk 4
+            (chunk_size, 200),   # Chunk 5
+            (chunk_size, 350),   # Chunk 6
+            (chunk_size, context_window),  # Chunk 7+: full (500)
         ]
 
         # Stream tokens from T3
@@ -632,15 +624,14 @@ class ChatterboxTurboTTS:
 
                 # Get dynamic parameters based on chunk count (ramp up over time)
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                current_chunk_size, current_context, current_overlap = ramp_schedule[schedule_idx]
+                current_chunk_size, current_context = ramp_schedule[schedule_idx]
 
                 # When we have enough tokens, process and yield audio
                 if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
 
-                    audio_tensor, audio_duration, success, prev_chunk_tail = self._process_token_chunk_ola(
-                        new_tokens, all_tokens, current_context, start_time, metrics,
-                        prev_chunk_tail, overlap_samples=current_overlap
+                    audio_tensor, audio_duration, success = self._process_token_chunk(
+                        new_tokens, all_tokens, current_context, start_time, metrics
                     )
 
                     if success:
@@ -656,11 +647,10 @@ class ChatterboxTurboTTS:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
                 # Use current schedule for final chunk
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                _, current_context, current_overlap = ramp_schedule[schedule_idx]
+                _, current_context = ramp_schedule[schedule_idx]
 
-                audio_tensor, audio_duration, success, _ = self._process_token_chunk_ola(
-                    new_tokens, all_tokens, current_context, start_time, metrics,
-                    prev_chunk_tail, overlap_samples=current_overlap
+                audio_tensor, audio_duration, success = self._process_token_chunk(
+                    new_tokens, all_tokens, current_context, start_time, metrics
                 )
 
                 if success:
