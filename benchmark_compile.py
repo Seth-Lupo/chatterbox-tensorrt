@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torchaudio
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -105,6 +106,8 @@ def main():
     parser.add_argument("--compile_mode", type=str, default="tensorrt",
                         choices=["tensorrt", "default", "max-autotune"],
                         help="Compilation mode")
+    parser.add_argument("--output", type=str, default="output.wav",
+                        help="Output audio file path")
     args = parser.parse_args()
 
     print("="*60)
@@ -181,6 +184,23 @@ def main():
         print("Performance: NEEDS OPTIMIZATION (> 1s first chunk)")
 
     print("="*60)
+
+    # =========================================================================
+    # Save sample output
+    # =========================================================================
+    print(f"\nGenerating sample audio to {args.output}...")
+    audio_chunks = []
+    for chunk, _ in model.generate_stream(
+        text=TEST_TEXTS[0],
+        audio_prompt_path=args.audio_prompt,
+        chunk_size=25,
+        context_window=50,
+    ):
+        audio_chunks.append(chunk)
+
+    final_audio = torch.cat(audio_chunks, dim=-1)
+    torchaudio.save(args.output, final_audio, model.sr)
+    print(f"Saved to {args.output}")
 
 
 if __name__ == "__main__":
