@@ -584,12 +584,6 @@ class ChatterboxTurboTTS:
                 # Blend the overlap region: prev_tail was held back, now blend with new chunk start
                 blended = prev_tail[:blend_len] * fade_out + audio_chunk[:blend_len] * fade_in
                 audio_chunk = np.concatenate([blended, audio_chunk[blend_len:]])
-        else:
-            # First chunk: apply fade-in to avoid click at start
-            fade_in_samples = min(crossfade_samples, len(audio_chunk))
-            if fade_in_samples > 0:
-                fade_in = np.linspace(0, 1, fade_in_samples, dtype=audio_chunk.dtype)
-                audio_chunk[:fade_in_samples] *= fade_in
 
         # Hold back tail samples for blending with next chunk (don't output them yet)
         if len(audio_chunk) > crossfade_samples:
@@ -737,13 +731,10 @@ class ChatterboxTurboTTS:
                     total_audio_duration += audio_duration
                     yield audio_tensor, metrics
 
-            # Flush the held-back tail with fade-out applied
+            # Flush the held-back tail (output remaining samples)
             if prev_tail is not None and len(prev_tail) > 0:
-                # Apply fade-out to prevent click at end
-                fade_out = np.linspace(1, 0, len(prev_tail), dtype=prev_tail.dtype)
-                final_tail = prev_tail * fade_out
-                final_audio = torch.from_numpy(final_tail.copy()).unsqueeze(0)
-                total_audio_duration += len(final_tail) / self.sr
+                final_audio = torch.from_numpy(prev_tail.copy()).unsqueeze(0)
+                total_audio_duration += len(prev_tail) / self.sr
                 metrics.chunk_count += 1
                 yield final_audio, metrics
 
