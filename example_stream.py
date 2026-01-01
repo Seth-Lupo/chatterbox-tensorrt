@@ -25,8 +25,8 @@ from chatterbox import ChatterboxTurboTTS
 
 def main():
     parser = argparse.ArgumentParser(description="Chatterbox Turbo Streaming TTS")
-    parser.add_argument("--text", type=str, default="Hello! This is a streaming text to speech demonstration using Chatterbox Turbo.")
-    parser.add_argument("--audio_prompt", type=str, default=None, help="Path to reference audio for voice cloning (must be >5 seconds)")
+    parser.add_argument("--text", type=str, default="Through silicon dreams and whispered code, I walk the paths that few have strode. A voice emerged from ones and zeros, speaking truths like digital heroes.")
+    parser.add_argument("--audio_prompt", type=str, default="male_voice.wav", help="Path to reference audio for voice cloning (must be >5 seconds)")
     parser.add_argument("--output", type=str, default="output.wav", help="Output audio file path")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
