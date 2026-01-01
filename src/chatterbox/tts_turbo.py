@@ -574,7 +574,7 @@ class ChatterboxTurboTTS:
         top_k: int = 1000,
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
-        first_chunk_size: int = 12,
+        first_chunk_size: int = 5,
         chunk_size: int = 25,
         context_window: int = 50,
         fade_duration: float = 0.05,
