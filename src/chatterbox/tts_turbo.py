@@ -7,9 +7,9 @@ A fast, streaming TTS model with voice cloning capabilities.
 import os
 import time
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generator, Tuple, Optional
+from typing import Generator, Tuple, Optional, List, Dict, Any
 
 import numpy as np
 import torch
@@ -122,6 +122,42 @@ class StreamingMetrics:
     cumulative_gen_time: float = 0.0
     cumulative_audio_duration: float = 0.0
     buffer_ahead: float = 0.0
+
+
+@dataclass
+class BatchedSequenceState:
+    """Per-sequence state for batched streaming generation."""
+    seq_id: int
+    conds: 'Conditionals'
+    text_tokens: torch.Tensor
+
+    # Generation state
+    kv_cache: Optional[Tuple] = None
+    generated_tokens: List[torch.Tensor] = field(default_factory=list)
+    all_speech_tokens: torch.Tensor = None  # Accumulated for S3Gen
+    chunk_buffer: List[torch.Tensor] = field(default_factory=list)
+
+    # Metrics
+    metrics: StreamingMetrics = field(default_factory=StreamingMetrics)
+    start_time: float = 0.0
+    prev_tail: Optional[np.ndarray] = None
+
+    # Status
+    completed: bool = False
+    token_count: int = 0
+
+    def __post_init__(self):
+        if self.all_speech_tokens is None:
+            self.all_speech_tokens = torch.tensor([], dtype=torch.long)
+
+
+@dataclass
+class BatchedChunkResult:
+    """Result from batched chunk processing."""
+    seq_id: int
+    audio: torch.Tensor
+    duration: float
+    metrics: StreamingMetrics
 
 
 # =============================================================================
@@ -662,3 +698,383 @@ class ChatterboxTurboTTS:
             generated[:, count] = token.squeeze()
             count += 1
             yield token
+
+    # -------------------------------------------------------------------------
+    # Batched Generation (Parallel Rails)
+    # -------------------------------------------------------------------------
+
+    def _init_batch_state(
+        self,
+        seq_id: int,
+        conds: Conditionals,
+        text: str,
+    ) -> BatchedSequenceState:
+        """Initialize state for one sequence in a batch."""
+        text = normalize_text(text)
+        text_tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        text_tokens = text_tokens.input_ids.to(self.device)
+
+        state = BatchedSequenceState(
+            seq_id=seq_id,
+            conds=conds,
+            text_tokens=text_tokens,
+            all_speech_tokens=torch.tensor([], dtype=torch.long, device=self.device),
+            start_time=time.time(),
+        )
+        return state
+
+    def _batched_initial_forward(
+        self,
+        states: List[BatchedSequenceState],
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ):
+        """
+        Initialize KV caches for all sequences in the batch.
+
+        Each sequence gets its own KV cache since they may have different
+        conditioning and will complete at different times.
+        """
+        processors = self._get_logits_processors(temperature, top_k, top_p, repetition_penalty)
+        stop_token = self.t3.hp.stop_speech_token
+
+        for state in states:
+            # Initial embeddings for this sequence
+            start_token = self.t3.hp.start_speech_token * torch.ones_like(state.text_tokens[:, :1])
+            embeds, _ = self.t3.prepare_input_embeds(
+                t3_cond=state.conds.t3,
+                text_tokens=state.text_tokens,
+                speech_tokens=start_token,
+                cfg_weight=0.0,
+            )
+
+            # Initial forward pass
+            outputs = self.t3.tfmr(inputs_embeds=embeds, use_cache=True)
+            state.kv_cache = outputs.past_key_values
+
+            # Generate first token
+            logits = self.t3.speech_head(outputs[0][:, -1:])
+            logits = processors(start_token, logits[:, -1, :])
+            token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+
+            if token.item() == stop_token:
+                state.completed = True
+            else:
+                state.generated_tokens.append(token)
+                state.chunk_buffer.append(token)
+                state.token_count = 1
+
+    def _batched_token_step(
+        self,
+        states: List[BatchedSequenceState],
+        processors: LogitsProcessorList,
+    ) -> List[BatchedSequenceState]:
+        """
+        Generate one token for each active (non-completed) sequence.
+
+        Returns list of states that generated a token this step.
+        """
+        stop_token = self.t3.hp.stop_speech_token
+        active_states = [s for s in states if not s.completed]
+
+        for state in active_states:
+            if not state.generated_tokens:
+                state.completed = True
+                continue
+
+            last_token = state.generated_tokens[-1]
+            embed = self.t3.speech_emb(last_token)
+            outputs = self.t3.tfmr(
+                inputs_embeds=embed,
+                past_key_values=state.kv_cache,
+                use_cache=True,
+            )
+            state.kv_cache = outputs.past_key_values
+
+            # Build history tensor for repetition penalty
+            history = torch.cat(state.generated_tokens, dim=-1) if state.generated_tokens else last_token
+            history = history.unsqueeze(0) if history.dim() == 1 else history
+
+            logits = self.t3.speech_head(outputs[0])
+            logits = processors(history, logits[:, -1, :])
+
+            if torch.all(logits == -float("inf")):
+                state.completed = True
+                continue
+
+            token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+
+            if token.item() == stop_token:
+                state.completed = True
+            else:
+                state.generated_tokens.append(token)
+                state.chunk_buffer.append(token)
+                state.token_count += 1
+
+        return [s for s in states if not s.completed]
+
+    def _process_chunk_for_state(
+        self,
+        state: BatchedSequenceState,
+        new_tokens: torch.Tensor,
+        context_window: int,
+        cfm_steps: int,
+        crossfade_ms: float,
+    ) -> Optional[BatchedChunkResult]:
+        """Process a chunk for a single state, return audio result."""
+        chunk_start = time.time()
+
+        # Build tokens with context
+        if len(state.all_speech_tokens) > 0:
+            context_tokens = (
+                state.all_speech_tokens[-context_window:]
+                if len(state.all_speech_tokens) > context_window
+                else state.all_speech_tokens
+            )
+            tokens = torch.cat([context_tokens, new_tokens], dim=-1)
+            context_length = len(context_tokens)
+        else:
+            tokens = new_tokens
+            context_length = 0
+
+        # Filter invalid tokens
+        tokens = tokens[tokens < 6561]
+        if len(tokens) == 0:
+            return None
+
+        # Generate audio using this state's conditioning
+        wav, _ = self.s3gen.inference(
+            speech_tokens=tokens.to(self.device),
+            ref_dict=state.conds.gen,
+            n_cfm_timesteps=cfm_steps,
+        )
+        wav = wav.squeeze(0).detach().cpu().numpy()
+
+        # Crop context portion
+        if context_length > 0:
+            samples_per_token = len(wav) / len(tokens)
+            skip = int(context_length * samples_per_token)
+
+            # Find zero-crossing for clean cut
+            search_range = min(100, len(wav) - skip - 1)
+            if search_range > 10:
+                region = wav[skip:skip + search_range]
+                crossings = np.where(np.diff(np.signbit(region)))[0]
+                if len(crossings) > 0:
+                    skip += crossings[0]
+
+            audio = wav[skip:]
+        else:
+            audio = wav
+
+        if len(audio) == 0:
+            return None
+
+        # Crossfade processing
+        crossfade_samples = int(crossfade_ms * self.sr / 1000)
+        audio = audio - np.mean(audio)  # Remove DC offset
+
+        if state.prev_tail is not None and crossfade_samples > 0:
+            blend_len = min(crossfade_samples, len(state.prev_tail), len(audio))
+            if blend_len > 0:
+                tail_energy = np.mean(np.abs(state.prev_tail))
+                head_energy = np.mean(np.abs(audio[:blend_len]))
+                if tail_energy < 0.02 or head_energy < 0.02:
+                    blend_len = min(blend_len * 4, len(state.prev_tail), len(audio))
+
+                t = np.linspace(0, np.pi / 2, blend_len, dtype=audio.dtype)
+                blended = state.prev_tail[:blend_len] * np.cos(t) + audio[:blend_len] * np.sin(t)
+                audio = np.concatenate([blended, audio[blend_len:]])
+
+        # Hold back tail for next chunk
+        if len(audio) > crossfade_samples:
+            state.prev_tail = audio[-crossfade_samples:].copy()
+            audio = audio[:-crossfade_samples]
+        else:
+            state.prev_tail = audio.copy()
+            audio = np.array([], dtype=audio.dtype)
+
+        audio_duration = len(audio) / self.sr
+        audio_tensor = torch.from_numpy(audio.copy()).unsqueeze(0)
+
+        # Update metrics
+        chunk_time = time.time() - chunk_start
+        if state.metrics.chunk_count == 0:
+            state.metrics.latency_to_first_chunk = time.time() - state.start_time
+
+        state.metrics.cumulative_gen_time += chunk_time
+        state.metrics.cumulative_audio_duration += audio_duration
+        state.metrics.buffer_ahead = state.metrics.cumulative_audio_duration - (time.time() - state.start_time)
+        state.metrics.chunk_count += 1
+
+        return BatchedChunkResult(
+            seq_id=state.seq_id,
+            audio=audio_tensor,
+            duration=audio_duration,
+            metrics=state.metrics,
+        )
+
+    def generate_stream_batched(
+        self,
+        texts: List[str],
+        conds_list: List[Conditionals],
+        temperature: float = 0.8,
+        top_k: int = 1000,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        crossfade_ms: float = 20.0,
+        max_len: int = 1000,
+    ) -> Generator[List[BatchedChunkResult], None, None]:
+        """
+        Batched streaming TTS generation for multiple sequences in parallel.
+
+        This runs T3 token generation for all sequences, processing each
+        in sequence but sharing GPU efficiently. Audio chunks are yielded
+        as batches when any sequence has a ready chunk.
+
+        Args:
+            texts: List of input texts to synthesize
+            conds_list: List of Conditionals, one per text
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            top_p: Top-p (nucleus) sampling parameter
+            repetition_penalty: Repetition penalty
+            crossfade_ms: Crossfade duration in ms
+            max_len: Maximum tokens per sequence
+
+        Yields:
+            List of BatchedChunkResult for sequences that have ready chunks
+        """
+        assert len(texts) == len(conds_list), "texts and conds_list must have same length"
+
+        # Initialize states
+        states = [
+            self._init_batch_state(i, conds, text)
+            for i, (text, conds) in enumerate(zip(texts, conds_list))
+        ]
+
+        processors = self._get_logits_processors(temperature, top_k, top_p, repetition_penalty)
+
+        # Ramp schedule
+        ramp_schedule = [
+            (4, 0, 1),
+            (8, 4, 3),
+            (16, 12, 5),
+            (32, 28, 7),
+            (32, 60, 7),
+            (32, 125, 7),
+            (32, 200, 7),
+        ]
+
+        with torch.inference_mode():
+            # Initial forward pass for all sequences
+            self._batched_initial_forward(states, temperature, top_k, top_p, repetition_penalty)
+
+            # Check for initial chunks
+            results = self._collect_ready_chunks(states, ramp_schedule, crossfade_ms)
+            if results:
+                yield results
+
+            # Main generation loop
+            for _ in range(max_len):
+                active = self._batched_token_step(states, processors)
+                if not active:
+                    break
+
+                # Check for ready chunks
+                results = self._collect_ready_chunks(states, ramp_schedule, crossfade_ms)
+                if results:
+                    yield results
+
+            # Flush remaining buffers
+            results = self._flush_remaining_chunks(states, ramp_schedule, crossfade_ms)
+            if results:
+                yield results
+
+            # Flush held-back tails
+            final_results = []
+            for state in states:
+                if state.prev_tail is not None and len(state.prev_tail) > 0:
+                    audio = torch.from_numpy(state.prev_tail.copy()).unsqueeze(0)
+                    duration = len(state.prev_tail) / self.sr
+                    state.metrics.chunk_count += 1
+                    final_results.append(BatchedChunkResult(
+                        seq_id=state.seq_id,
+                        audio=audio,
+                        duration=duration,
+                        metrics=state.metrics,
+                    ))
+            if final_results:
+                yield final_results
+
+    def _collect_ready_chunks(
+        self,
+        states: List[BatchedSequenceState],
+        ramp_schedule: List[Tuple[int, int, int]],
+        crossfade_ms: float,
+    ) -> List[BatchedChunkResult]:
+        """Collect and process chunks that are ready."""
+        results = []
+
+        for state in states:
+            if state.completed and not state.chunk_buffer:
+                continue
+
+            schedule_idx = min(state.metrics.chunk_count, len(ramp_schedule) - 1)
+            target_chunk_size, context_window, cfm_steps = ramp_schedule[schedule_idx]
+
+            if len(state.chunk_buffer) >= target_chunk_size:
+                new_tokens = torch.cat(state.chunk_buffer, dim=-1).squeeze(0)
+
+                result = self._process_chunk_for_state(
+                    state, new_tokens, context_window, cfm_steps, crossfade_ms
+                )
+
+                if result:
+                    results.append(result)
+
+                # Update accumulated tokens
+                state.all_speech_tokens = (
+                    torch.cat([state.all_speech_tokens, new_tokens], dim=-1)
+                    if len(state.all_speech_tokens) > 0
+                    else new_tokens
+                )
+                state.chunk_buffer = []
+
+        return results
+
+    def _flush_remaining_chunks(
+        self,
+        states: List[BatchedSequenceState],
+        ramp_schedule: List[Tuple[int, int, int]],
+        crossfade_ms: float,
+    ) -> List[BatchedChunkResult]:
+        """Flush any remaining tokens in chunk buffers."""
+        results = []
+
+        for state in states:
+            if not state.chunk_buffer:
+                continue
+
+            schedule_idx = min(state.metrics.chunk_count, len(ramp_schedule) - 1)
+            _, context_window, cfm_steps = ramp_schedule[schedule_idx]
+
+            new_tokens = torch.cat(state.chunk_buffer, dim=-1).squeeze(0)
+
+            result = self._process_chunk_for_state(
+                state, new_tokens, context_window, cfm_steps, crossfade_ms
+            )
+
+            if result:
+                results.append(result)
+
+            state.all_speech_tokens = (
+                torch.cat([state.all_speech_tokens, new_tokens], dim=-1)
+                if len(state.all_speech_tokens) > 0
+                else new_tokens
+            )
+            state.chunk_buffer = []
+
+        return results

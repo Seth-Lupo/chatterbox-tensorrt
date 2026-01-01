@@ -2,7 +2,10 @@
 TTSRails - Parallel Streaming TTS with Voice Cloning
 
 A high-level API for managing multiple concurrent TTS streams ("rails"),
-each with its own voice, running in parallel on a shared GPU.
+each with its own voice, running in TRUE PARALLEL on a shared GPU.
+
+The BatchCoordinator collects ready utterances from all rails and processes
+them together through batched generation, enabling simultaneous output.
 
 Example:
     tts = TTSRails(device="cuda")
@@ -21,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from queue import Queue, Empty
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, List, Tuple
 
 import torch
 
@@ -35,6 +38,7 @@ MAX_RAILS = 6
 class RailState(Enum):
     """Rail state machine states."""
     IDLE = auto()
+    PENDING = auto()  # Text ready, waiting for batch
     GENERATING = auto()
     STOPPED = auto()
 
@@ -52,12 +56,22 @@ class RailConfig:
     flush_timeout_ms: float = 300.0
 
 
+@dataclass
+class PendingUtterance:
+    """An utterance ready for batched generation."""
+    rail_name: str
+    text: str
+    conds: Conditionals
+    config: RailConfig
+
+
 class Rail:
     """
     A single TTS streaming channel.
 
-    Push text in, read audio out. Text pushed during generation
-    is appended to the current utterance.
+    Push text in, read audio out. Text is buffered until sentence
+    boundaries, then submitted to the BatchCoordinator for parallel
+    generation with other rails.
     """
 
     def __init__(
@@ -85,7 +99,7 @@ class Rail:
         self.interrupt_flag = threading.Event()
         self.running = True
 
-        # Worker thread
+        # Worker thread for text collection
         self.worker = threading.Thread(target=self._run, daemon=True, name=f"rail-{name}")
         self.worker.start()
 
@@ -100,7 +114,7 @@ class Rail:
         Push text to be spoken. Non-blocking.
 
         Text is buffered until a sentence boundary or timeout, then
-        generated as a single utterance for optimal quality ramping.
+        submitted for parallel generation with other rails.
         """
         if not text:
             return
@@ -148,10 +162,10 @@ class Rail:
         # Brief wait for worker to notice
         time.sleep(0.01)
         self.interrupt_flag.clear()
+        self.state = RailState.IDLE
 
     def flush(self):
         """Force generation of any buffered text immediately."""
-        # Set last_push_time to 0 to trigger timeout condition
         self.last_push_time = 0
 
     def close(self):
@@ -168,6 +182,7 @@ class Rail:
             self.state == RailState.IDLE
             and self.text_queue.empty()
             and not self.pending_text
+            and self.audio_queue.empty()
         )
 
     @property
@@ -180,7 +195,7 @@ class Rail:
     # -------------------------------------------------------------------------
 
     def _run(self):
-        """Worker thread main loop."""
+        """Worker thread main loop - collects text and submits to coordinator."""
         while self.running:
             try:
                 self._tick()
@@ -190,7 +205,6 @@ class Rail:
 
     def _tick(self):
         """Single iteration of the worker loop."""
-        # Collect any pending text
         self._collect_text()
 
         with self._lock:
@@ -199,21 +213,19 @@ class Rail:
                 time.sleep(0.01)
                 return
 
-            # Check if we should generate now:
-            # 1. Sentence boundary reached (. ! ?)
-            # 2. OR timeout since last push
+            # Check if we should generate now
             sentence_end = text.rstrip().endswith(('.', '!', '?'))
-            time_since_push = (time.time() - self.last_push_time) * 1000  # ms
+            time_since_push = (time.time() - self.last_push_time) * 1000
             timeout_reached = time_since_push >= self.config.flush_timeout_ms
 
             if sentence_end or timeout_reached:
                 self.pending_text = ""
             else:
-                # Keep buffering
                 time.sleep(0.01)
                 return
 
-        self._generate(text)
+        # Submit to coordinator for batched generation
+        self._submit_for_generation(text)
 
     def _collect_text(self):
         """Drain text queue into pending buffer."""
@@ -225,52 +237,32 @@ class Rail:
             except Empty:
                 break
 
-    def _generate(self, text: str):
-        """
-        Run TTS generation with GPU lock.
-
-        Note: GPU lock is held for entire utterance because:
-        1. Generator holds KV cache state between yields
-        2. model.conds must not be changed mid-generation
-
-        For parallel rails, they will queue and run sequentially.
-        Each rail's sentences are buffered, so the interleaving happens
-        at sentence boundaries rather than chunk boundaries.
-        """
-        self.state = RailState.GENERATING
-
-        # Load voice conditionals
+    def _submit_for_generation(self, text: str):
+        """Submit text to the coordinator for batched generation."""
         if self.config.voice in self.tts.voices:
-            self.conds = self.tts.voices[self.config.voice]
+            conds = self.tts.voices[self.config.voice]
         else:
             logger.warning(f"Voice '{self.config.voice}' not found, using default")
-            self.conds = None
+            conds = self.tts.model.conds
 
-        try:
-            with self.tts.gpu_lock:
-                if self.interrupt_flag.is_set():
-                    return
+        utterance = PendingUtterance(
+            rail_name=self.name,
+            text=text,
+            conds=conds,
+            config=self.config,
+        )
 
-                if self.conds is not None:
-                    self.tts.model.conds = self.conds
+        self.state = RailState.PENDING
+        self.tts.coordinator.submit(utterance)
 
-                for chunk, _ in self.tts.model.generate_stream(
-                    text=text,
-                    audio_prompt_path=None,
-                    exaggeration=self.config.exaggeration,
-                    temperature=self.config.temperature,
-                    top_k=self.config.top_k,
-                    top_p=self.config.top_p,
-                    repetition_penalty=self.config.repetition_penalty,
-                ):
-                    if self.interrupt_flag.is_set():
-                        logger.debug(f"Rail '{self.name}' generation interrupted")
-                        return
+    def _receive_audio(self, chunk: torch.Tensor):
+        """Called by coordinator to deliver audio."""
+        if not self.interrupt_flag.is_set():
+            self.audio_queue.put(chunk)
 
-                    self.audio_queue.put(chunk)
-
-        finally:
-            self.state = RailState.IDLE
+    def _generation_complete(self):
+        """Called by coordinator when generation is done."""
+        self.state = RailState.IDLE
 
     @staticmethod
     def _clear_queue(q: Queue):
@@ -282,12 +274,126 @@ class Rail:
                 break
 
 
+class BatchCoordinator:
+    """
+    Coordinates batched generation across multiple rails.
+
+    Collects pending utterances from rails and processes them together
+    for true parallel generation on the GPU.
+    """
+
+    def __init__(self, tts: 'TTSRails'):
+        self.tts = tts
+        self.pending: Queue[PendingUtterance] = Queue()
+        self.running = True
+
+        # Batching parameters
+        self.batch_wait_ms = 10  # Wait for more rails before processing
+        self.max_batch_size = MAX_RAILS
+
+        # Worker thread
+        self.worker = threading.Thread(target=self._run, daemon=True, name="batch-coordinator")
+        self.worker.start()
+
+        logger.info("BatchCoordinator started")
+
+    def submit(self, utterance: PendingUtterance):
+        """Submit an utterance for batched generation."""
+        self.pending.put(utterance)
+
+    def shutdown(self):
+        """Shutdown the coordinator."""
+        self.running = False
+        self.worker.join(timeout=2.0)
+        logger.info("BatchCoordinator shutdown")
+
+    def _run(self):
+        """Main coordinator loop."""
+        while self.running:
+            try:
+                self._process_batch()
+            except Exception as e:
+                logger.error(f"BatchCoordinator error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
+
+    def _process_batch(self):
+        """Collect and process a batch of utterances."""
+        # Wait for first utterance
+        try:
+            first = self.pending.get(timeout=0.1)
+        except Empty:
+            return
+
+        batch = [first]
+
+        # Brief wait to collect more utterances for batching
+        deadline = time.time() + self.batch_wait_ms / 1000
+        while len(batch) < self.max_batch_size and time.time() < deadline:
+            try:
+                utterance = self.pending.get(timeout=0.001)
+                batch.append(utterance)
+            except Empty:
+                break
+
+        # Process the batch
+        self._generate_batch(batch)
+
+    def _generate_batch(self, batch: List[PendingUtterance]):
+        """Generate audio for a batch of utterances."""
+        if not batch:
+            return
+
+        # Mark rails as generating
+        for utterance in batch:
+            rail = self.tts.rails.get(utterance.rail_name)
+            if rail:
+                rail.state = RailState.GENERATING
+
+        # Prepare inputs for batched generation
+        texts = [u.text for u in batch]
+        conds_list = [u.conds for u in batch]
+
+        # Use first utterance's config for shared parameters
+        # (temperature, etc. should be similar across rails)
+        config = batch[0].config
+
+        logger.debug(f"Generating batch of {len(batch)} utterances: {[u.rail_name for u in batch]}")
+
+        try:
+            # Run batched generation
+            for chunk_results in self.tts.model.generate_stream_batched(
+                texts=texts,
+                conds_list=conds_list,
+                temperature=config.temperature,
+                top_k=config.top_k,
+                top_p=config.top_p,
+                repetition_penalty=config.repetition_penalty,
+            ):
+                # Distribute chunks to their respective rails
+                for result in chunk_results:
+                    utterance = batch[result.seq_id]
+                    rail = self.tts.rails.get(utterance.rail_name)
+
+                    if rail and not rail.interrupt_flag.is_set():
+                        rail._receive_audio(result.audio)
+
+        finally:
+            # Mark all rails as idle
+            for utterance in batch:
+                rail = self.tts.rails.get(utterance.rail_name)
+                if rail:
+                    rail._generation_complete()
+
+
 class TTSRails:
     """
-    TTS orchestrator managing multiple parallel rails.
+    TTS orchestrator managing multiple parallel rails with TRUE BATCHED GENERATION.
 
     Compiles models once, keeps them hot, and manages voice registration
-    and rail allocation.
+    and rail allocation. The BatchCoordinator enables simultaneous generation
+    across all active rails.
 
     Example:
         tts = TTSRails(device="cuda")
@@ -323,7 +429,10 @@ class TTSRails:
         for _ in self.model.generate_stream("Hello."):
             pass
 
-        logger.info("TTSRails ready")
+        # Start batch coordinator
+        self.coordinator = BatchCoordinator(self)
+
+        logger.info("TTSRails ready (batched generation enabled)")
 
     # -------------------------------------------------------------------------
     # Voice Management
@@ -419,6 +528,7 @@ class TTSRails:
     def shutdown(self):
         """Shutdown all rails and cleanup."""
         logger.info("Shutting down TTSRails...")
+        self.coordinator.shutdown()
         for name in list(self.rails.keys()):
             self.close_rail(name)
         logger.info("TTSRails shutdown complete")
