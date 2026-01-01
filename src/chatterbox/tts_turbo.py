@@ -225,21 +225,27 @@ class ChatterboxTurboTTS:
         if mode == "static-cudagraphs":
             # CUDA graphs with static shapes - very fast decoding
             logger.info("Compiling with CUDA graphs (static cache mode)")
-            # Compile T3 with fullgraph for CUDA graph capture
+
+            # Enable capture of scalar outputs for cache_position in GPT2
+            import torch._dynamo.config
+            torch._dynamo.config.capture_scalar_outputs = True
+
+            # Compile T3 transformer - use reduce-overhead for CUDA graphs
+            # Note: GPT2 has some data-dependent ops, so we don't use fullgraph
             self.t3.tfmr = torch.compile(
                 self.t3.tfmr,
                 mode="reduce-overhead",  # Enables CUDA graphs
-                fullgraph=True,  # Full graph capture for static shapes
             )
+            # These small modules can use fullgraph
             self.t3.speech_emb = torch.compile(self.t3.speech_emb, fullgraph=True)
             self.t3.speech_head = torch.compile(self.t3.speech_head, fullgraph=True)
-            # S3Gen flow also benefits from static compilation
+            # S3Gen flow benefits from static compilation
             self.s3gen.flow = torch.compile(
                 self.s3gen.flow,
                 mode="reduce-overhead",
                 fullgraph=True,
             )
-            logger.info("T3 and S3Gen compiled with CUDA graphs (fullgraph=True)")
+            logger.info("T3 and S3Gen compiled with CUDA graphs")
             self._compiled = True
             return
 
