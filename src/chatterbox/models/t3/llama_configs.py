@@ -37,10 +37,10 @@ GPT2_MEDIUM_CONFIG = {
   "architectures": [
     "GPT2LMHeadModel"
   ],
-  "attn_pdrop": 0.1,
+  "attn_pdrop": 0.0,  # Disable dropout for inference (faster)
   "attn_implementation": "sdpa",  # Enable Flash Attention via SDPA
   "bos_token_id": 50256,
-  "embd_pdrop": 0.1,
+  "embd_pdrop": 0.0,  # Disable dropout for inference (faster)
   "eos_token_id": 50256,
   "initializer_range": 0.02,
   "layer_norm_epsilon": 1e-05,
@@ -53,9 +53,9 @@ GPT2_MEDIUM_CONFIG = {
   "n_positions": 8196,
   "n_special": 0,
   "predict_special_tokens": True,
-  "resid_pdrop": 0.1,
+  "resid_pdrop": 0.0,  # Disable dropout for inference (faster)
   "summary_activation": None,
-  "summary_first_dropout": 0.1,
+  "summary_first_dropout": 0.0,  # Disable dropout for inference (faster)
   "summary_proj_to_labels": True,
   "summary_type": "cls_index",
   "summary_use_proj": True,
@@ -65,6 +65,7 @@ GPT2_MEDIUM_CONFIG = {
       "max_length": 50
     }
   },
+  "use_cache": True,  # Enable KV cache for faster autoregressive generation
   "vocab_size": 50276,
 }
 

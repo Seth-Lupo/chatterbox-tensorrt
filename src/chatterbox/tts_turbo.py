@@ -44,6 +44,9 @@ def setup_cuda_optimizations():
         torch.backends.cudnn.benchmark = True
         # Disable debug/profiling overhead
         torch.backends.cudnn.enabled = True
+        # Enable Flash Attention via SDPA when available
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
 
