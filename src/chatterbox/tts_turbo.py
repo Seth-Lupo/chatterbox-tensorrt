@@ -142,6 +142,10 @@ class StreamingMetrics:
     total_generation_time: Optional[float] = None
     total_audio_duration: Optional[float] = None
     chunk_count: int = 0
+    # Realtime tracking: how far ahead of playback are we?
+    cumulative_gen_time: float = 0.0      # Total time spent generating
+    cumulative_audio_duration: float = 0.0  # Total audio produced
+    buffer_ahead: float = 0.0              # Audio duration ahead of realtime (positive = good)
 
 
 class ChatterboxTurboTTS:
@@ -502,6 +506,8 @@ class ChatterboxTurboTTS:
         cfm_steps: int = 5,
     ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
         """Process a chunk of tokens and return audio with optional crossfade."""
+        chunk_start = time.time()
+
         # Build tokens_to_process by including context window
         if len(all_tokens_so_far) > 0:
             context_tokens = (
@@ -562,9 +568,20 @@ class ChatterboxTurboTTS:
         audio_duration = len(audio_chunk) / self.sr
         audio_tensor = torch.from_numpy(audio_chunk.copy()).unsqueeze(0)
 
+        # Track chunk generation time
+        chunk_gen_time = time.time() - chunk_start
+
         # Update first-chunk latency metric
         if metrics.chunk_count == 0:
             metrics.latency_to_first_chunk = time.time() - start_time
+
+        # Update realtime tracking
+        metrics.cumulative_gen_time += chunk_gen_time
+        metrics.cumulative_audio_duration += audio_duration
+        # buffer_ahead = audio produced - time elapsed since start
+        # Positive means we're ahead of realtime playback
+        elapsed_since_start = time.time() - start_time
+        metrics.buffer_ahead = metrics.cumulative_audio_duration - elapsed_since_start
 
         metrics.chunk_count += 1
         return audio_tensor, audio_duration, True, new_tail
@@ -623,16 +640,18 @@ class ChatterboxTurboTTS:
         prev_tail: Optional[np.ndarray] = None
 
         # Dynamic ramp-up schedule: [chunk_size, context_window, cfm_steps]
-        # Starts tiny for fast TTFA, doubles tokens each chunk until 32
+        # Tokens double: 2 → 4 → 8 → 16 → 32
+        # CFM steps: 1 → 2 → 4 → 8 → 10
         ramp_schedule = [
-            (4, 0, 1),         # Chunk 0: ultra-fast first chunk
-            (8, 4, 2),         # Chunk 1: doubling
-            (16, 12, 3),       # Chunk 2: doubling
-            (32, 28, 4),       # Chunk 3: doubling to max
-            (32, 60, cfm_steps),    # Chunk 4+: steady state
-            (32, 120, cfm_steps),   # Chunk 5
-            (32, 250, cfm_steps),   # Chunk 6
-            (32, context_window, cfm_steps),  # Chunk 7+: full (500)
+            (2, 0, 1),         # Chunk 0: ultra-fast first chunk
+            (4, 2, 2),         # Chunk 1: doubling
+            (8, 6, 4),         # Chunk 2: doubling
+            (16, 14, 8),       # Chunk 3: doubling
+            (32, 30, 10),      # Chunk 4: max tokens, max CFM
+            (32, 62, cfm_steps),    # Chunk 5+: steady state
+            (32, 125, cfm_steps),   # Chunk 6
+            (32, 250, cfm_steps),   # Chunk 7
+            (32, context_window, cfm_steps),  # Chunk 8+: full context (500)
         ]
 
         # Stream tokens from T3

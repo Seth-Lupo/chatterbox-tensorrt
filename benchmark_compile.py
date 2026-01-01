@@ -192,13 +192,20 @@ def main():
     print(f"\nGenerating sample audio to {args.output}...")
     sample_text = "Hello, this is a comprehensive test of the Chatterbox text to speech system. We are testing the streaming audio generation pipeline with torch compile optimizations enabled. The goal is to achieve low latency to first audio chunk while maintaining high quality speech synthesis. This longer sample helps verify that the full pipeline is working correctly from start to finish."
     audio_chunks = []
-    for chunk, _ in model.generate_stream(
+
+    print("\nRealtime Tracking (buffer_ahead = audio produced - time elapsed):")
+    print("-" * 60)
+    for chunk, metrics in model.generate_stream(
         text=sample_text,
         audio_prompt_path=args.audio_prompt,
-        chunk_size=25,
-        context_window=50,
     ):
         audio_chunks.append(chunk)
+        # Show realtime status
+        status = "AHEAD" if metrics.buffer_ahead > 0 else "BEHIND"
+        print(f"  Chunk {metrics.chunk_count}: "
+              f"audio={metrics.cumulative_audio_duration:.2f}s, "
+              f"gen_time={metrics.cumulative_gen_time:.2f}s, "
+              f"buffer={metrics.buffer_ahead:+.2f}s [{status}]")
 
     final_audio = torch.cat(audio_chunks, dim=-1)
     # Convert to int16 for wav file
