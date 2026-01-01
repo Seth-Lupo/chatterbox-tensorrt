@@ -158,9 +158,14 @@ def add_optional_chunk_mask(xs: torch.Tensor,
     else:
         chunk_masks = masks
     assert chunk_masks.dtype == torch.bool
-    if (chunk_masks.sum(dim=-1) == 0).sum().item() != 0:
-        logging.warning('get chunk_masks all false at some timestep, force set to true, make sure they are masked in futuer computation!')
-        chunk_masks[chunk_masks.sum(dim=-1)==0] = True
+    # Fix all-false rows without graph breaks (no .item() or .any())
+    all_false_mask = chunk_masks.sum(dim=-1) == 0  # (B, L)
+    # Use where to conditionally set True without Python control flow
+    chunk_masks = torch.where(
+        all_false_mask.unsqueeze(-1).expand_as(chunk_masks),
+        torch.ones_like(chunk_masks),
+        chunk_masks
+    )
     return chunk_masks
 
 

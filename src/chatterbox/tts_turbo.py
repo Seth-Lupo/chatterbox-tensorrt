@@ -188,47 +188,96 @@ class ChatterboxTurboTTS:
             import torch_tensorrt
             import logging as py_logging
             import warnings
+            import os
 
-            # Suppress verbose TensorRT logging
-            py_logging.getLogger("torch_tensorrt").setLevel(py_logging.WARNING)
-            py_logging.getLogger("torch._dynamo").setLevel(py_logging.WARNING)
-            py_logging.getLogger("torch._inductor").setLevel(py_logging.WARNING)
-            warnings.filterwarnings("ignore", category=UserWarning)
+            # Suppress verbose logging
+            os.environ["TORCHDYNAMO_VERBOSE"] = "0"
+            py_logging.getLogger("torch_tensorrt").setLevel(py_logging.ERROR)
+            py_logging.getLogger("torch._dynamo").setLevel(py_logging.ERROR)
+            py_logging.getLogger("torch._inductor").setLevel(py_logging.ERROR)
+            warnings.filterwarnings("ignore")
 
-            try:
-                self.s3gen.flow.decoder.estimator = torch.compile(
-                    self.s3gen.flow.decoder.estimator,
-                    backend="torch_tensorrt",
-                    dynamic=False,
-                    options={
-                        "truncate_long_and_double": True,
-                        "enabled_precisions": {torch.float16, torch.float32},
-                        "debug": False,
-                        "min_block_size": 1,
-                        "use_python_runtime": False,
-                    }
+            # Dynamic shape profiles: min, opt, max sequence lengths
+            min_seq, opt_seq, max_seq = 10, 200, 1000
+
+            # Define dynamic inputs with shape profiles
+            dynamic_inputs = [
+                # x: (1, 80, seq)
+                torch_tensorrt.Input(
+                    min_shape=(1, 80, min_seq),
+                    opt_shape=(1, 80, opt_seq),
+                    max_shape=(1, 80, max_seq),
+                    dtype=self.dtype,
+                ),
+                # mask: (1, 1, seq)
+                torch_tensorrt.Input(
+                    min_shape=(1, 1, min_seq),
+                    opt_shape=(1, 1, opt_seq),
+                    max_shape=(1, 1, max_seq),
+                    dtype=self.dtype,
+                ),
+                # mu: (1, 80, seq)
+                torch_tensorrt.Input(
+                    min_shape=(1, 80, min_seq),
+                    opt_shape=(1, 80, opt_seq),
+                    max_shape=(1, 80, max_seq),
+                    dtype=self.dtype,
+                ),
+                # t: (1,)
+                torch_tensorrt.Input(
+                    min_shape=(1,),
+                    opt_shape=(1,),
+                    max_shape=(1,),
+                    dtype=self.dtype,
+                ),
+                # spks: (1, 80)
+                torch_tensorrt.Input(
+                    min_shape=(1, 80),
+                    opt_shape=(1, 80),
+                    max_shape=(1, 80),
+                    dtype=self.dtype,
+                ),
+                # cond: (1, 80, seq)
+                torch_tensorrt.Input(
+                    min_shape=(1, 80, min_seq),
+                    opt_shape=(1, 80, opt_seq),
+                    max_shape=(1, 80, max_seq),
+                    dtype=self.dtype,
+                ),
+                # r: (1,)
+                torch_tensorrt.Input(
+                    min_shape=(1,),
+                    opt_shape=(1,),
+                    max_shape=(1,),
+                    dtype=self.dtype,
+                ),
+            ]
+
+            # Compile with TensorRT using dynamic shapes
+            self.s3gen.flow.decoder.estimator = torch_tensorrt.compile(
+                self.s3gen.flow.decoder.estimator,
+                ir="dynamo",
+                inputs=dynamic_inputs,
+                enabled_precisions={torch.float16, torch.float32},
+                truncate_double=True,
+                min_block_size=1,
+                debug=False,
+            )
+
+            # Warmup with opt shape
+            with torch.inference_mode():
+                dummy_x = torch.randn(1, 80, opt_seq, device=self.device, dtype=self.dtype)
+                dummy_mask = torch.ones(1, 1, opt_seq, device=self.device, dtype=self.dtype)
+                dummy_mu = torch.randn(1, 80, opt_seq, device=self.device, dtype=self.dtype)
+                dummy_t = torch.tensor([0.5], device=self.device, dtype=self.dtype)
+                dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
+                dummy_cond = torch.randn(1, 80, opt_seq, device=self.device, dtype=self.dtype)
+                dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
+                _ = self.s3gen.flow.decoder.estimator(
+                    dummy_x, mask=dummy_mask, mu=dummy_mu, t=dummy_t,
+                    spks=dummy_spks, cond=dummy_cond, r=dummy_r
                 )
-            except Exception as e:
-                raise RuntimeError(f"TensorRT setup failed: {e}") from e
-
-            # Warmup to trigger engine build
-            try:
-                with torch.inference_mode():
-                    seq_len = 200
-                    dummy_x = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
-                    dummy_mask = torch.ones(1, 1, seq_len, device=self.device, dtype=self.dtype)
-                    dummy_mu = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
-                    dummy_t = torch.tensor([0.5], device=self.device, dtype=self.dtype)
-                    dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
-                    dummy_cond = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
-                    dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
-                    _ = self.s3gen.flow.decoder.estimator(
-                        dummy_x, mask=dummy_mask, mu=dummy_mu, t=dummy_t,
-                        spks=dummy_spks, cond=dummy_cond, r=dummy_r
-                    )
-                    torch.cuda.synchronize()
-            except Exception as e:
-                raise RuntimeError(f"TensorRT compilation failed: {e}") from e
+                torch.cuda.synchronize()
         else:
             compile_kwargs = {"dynamic": True}
             if mode == "max-autotune":

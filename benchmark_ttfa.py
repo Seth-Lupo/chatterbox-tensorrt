@@ -5,6 +5,16 @@ Time to First Audio (TTFA) Benchmark for Chatterbox Turbo Streaming TTS
 Measures latency from request initiation to first audio chunk delivery.
 """
 
+# Suppress all warnings before any imports
+import warnings
+import logging
+import os
+warnings.filterwarnings("ignore")
+os.environ["TORCHDYNAMO_VERBOSE"] = "0"
+os.environ["TORCH_LOGS"] = ""
+logging.getLogger("torch").setLevel(logging.ERROR)
+logging.getLogger("torch_tensorrt").setLevel(logging.ERROR)
+
 import argparse
 import gc
 import statistics
@@ -14,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 from chatterbox import ChatterboxTurboTTS
