@@ -201,10 +201,11 @@ class ChatterboxTurboTTS:
                 self.s3gen.flow.decoder.estimator = torch.compile(
                     self.s3gen.flow.decoder.estimator,
                     backend="torch_tensorrt",
+                    dynamic=False,  # Use static shapes to avoid infinity issue
                     options={
                         "truncate_long_and_double": True,
                         "enabled_precisions": {torch.float16, torch.float32},
-                        "debug": True,  # Enable debug to see TRT compilation
+                        "debug": True,
                         "min_block_size": 1,
                         "use_python_runtime": False,
                     }
@@ -212,17 +213,18 @@ class ChatterboxTurboTTS:
             except Exception as e:
                 raise RuntimeError(f"Failed to set up TensorRT compilation: {e}") from e
 
-            # Force compilation with warmup - this triggers actual TRT engine build
+            # Force compilation with warmup - triggers actual TRT engine build
             logger.info("Building TensorRT engine (this may take a minute)...")
             try:
                 with torch.inference_mode():
-                    # Match ConditionalDecoder.forward signature exactly
-                    dummy_x = torch.randn(1, 80, 100, device=self.device, dtype=self.dtype)
-                    dummy_mask = torch.ones(1, 1, 100, device=self.device, dtype=self.dtype)
-                    dummy_mu = torch.randn(1, 80, 100, device=self.device, dtype=self.dtype)
+                    # Use fixed shape for initial compilation
+                    seq_len = 200  # Typical sequence length
+                    dummy_x = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
+                    dummy_mask = torch.ones(1, 1, seq_len, device=self.device, dtype=self.dtype)
+                    dummy_mu = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
                     dummy_t = torch.tensor([0.5], device=self.device, dtype=self.dtype)
                     dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
-                    dummy_cond = torch.randn(1, 80, 100, device=self.device, dtype=self.dtype)
+                    dummy_cond = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
                     dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
 
                     # First forward triggers compilation
