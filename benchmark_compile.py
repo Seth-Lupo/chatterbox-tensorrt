@@ -104,9 +104,9 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark optimized Chatterbox Turbo")
     parser.add_argument("--iterations", type=int, default=5, help="Number of test iterations")
     parser.add_argument("--audio_prompt", type=str, default=None, help="Reference audio for voice cloning")
-    parser.add_argument("--compile_mode", type=str, default="static-cudagraphs",
-                        choices=["static-cudagraphs", "static-tensorrt", "tensorrt", "default", "max-autotune"],
-                        help="Compilation mode (static-cudagraphs is fastest with static KV cache)")
+    parser.add_argument("--compile_mode", type=str, default="default",
+                        choices=["default", "max-autotune", "tensorrt", None],
+                        help="Compilation mode (default uses torch.compile)")
     parser.add_argument("--output", type=str, default="output.wav",
                         help="Output audio file path")
     args = parser.parse_args()

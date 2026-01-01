@@ -13,7 +13,7 @@ import torchaudio
 
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer, StaticCache
+from transformers import AutoTokenizer
 from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -174,27 +174,6 @@ class ChatterboxTurboTTS:
         # Cached resamplers for GPU-accelerated audio processing
         self._resamplers = {}
 
-        # Static KV cache for faster autoregressive generation
-        self._static_cache = None
-        self._static_cache_max_len = 1500  # Max sequence: text + cond + speech tokens
-
-    def _get_or_create_static_cache(self, batch_size: int = 1) -> StaticCache:
-        """Get or create a static KV cache for faster generation."""
-        if self._static_cache is None:
-            self._static_cache = StaticCache(
-                config=self.t3.cfg,
-                batch_size=batch_size,
-                max_cache_len=self._static_cache_max_len,
-                device=self.device,
-                dtype=self.dtype,
-            )
-        return self._static_cache
-
-    def _reset_static_cache(self):
-        """Reset the static cache for a new generation."""
-        if self._static_cache is not None:
-            self._static_cache.reset()
-
     def _get_resampler(self, src_sr: int, dst_sr: int) -> torchaudio.transforms.Resample:
         """Get or create a cached resampler for the given sample rates."""
         key = (src_sr, dst_sr)
@@ -220,83 +199,6 @@ class ChatterboxTurboTTS:
             return
 
         logger.info(f"Compiling models with mode: {mode}")
-
-        # Static cache modes - leverage fixed shapes for maximum optimization
-        if mode == "static-cudagraphs":
-            # CUDA graphs with static shapes - very fast decoding
-            logger.info("Compiling with CUDA graphs (static cache mode)")
-
-            # Enable capture of scalar outputs for cache_position in GPT2
-            import torch._dynamo.config
-            torch._dynamo.config.capture_scalar_outputs = True
-
-            # Compile T3 transformer - use reduce-overhead for CUDA graphs
-            # Note: GPT2 has some data-dependent ops, so we don't use fullgraph
-            self.t3.tfmr = torch.compile(
-                self.t3.tfmr,
-                mode="reduce-overhead",  # Enables CUDA graphs
-            )
-            # These small modules can use fullgraph
-            self.t3.speech_emb = torch.compile(self.t3.speech_emb, fullgraph=True)
-            self.t3.speech_head = torch.compile(self.t3.speech_head, fullgraph=True)
-            # S3Gen flow benefits from static compilation
-            self.s3gen.flow = torch.compile(
-                self.s3gen.flow,
-                mode="reduce-overhead",
-                fullgraph=True,
-            )
-            logger.info("T3 and S3Gen compiled with CUDA graphs")
-            self._compiled = True
-            return
-
-        if mode == "static-tensorrt":
-            try:
-                import torch_tensorrt
-                logger.info("Compiling with TensorRT (static cache mode)")
-
-                # T3 transformer - static shapes with KV cache
-                # Decode step: 1 token input, fixed cache size
-                self.t3.tfmr = torch_tensorrt.compile(
-                    self.t3.tfmr,
-                    ir="dynamo",
-                    inputs=[
-                        torch_tensorrt.Input(
-                            shape=[1, 1, 1024],  # Single token embedding
-                            dtype=self.dtype,
-                        )
-                    ],
-                    enabled_precisions={self.dtype},
-                    truncate_long_and_double=True,
-                    min_block_size=1,
-                )
-                logger.info("T3 transformer compiled with TensorRT")
-
-                # S3Gen flow - variable length but bounded
-                self.s3gen.flow = torch_tensorrt.compile(
-                    self.s3gen.flow,
-                    inputs=[torch_tensorrt.Input(
-                        min_shape=[1, 80, 10],
-                        opt_shape=[1, 80, 200],
-                        max_shape=[1, 80, 1000],
-                        dtype=self.dtype,
-                    )],
-                    enabled_precisions={self.dtype},
-                    truncate_long_and_double=True,
-                )
-                logger.info("S3Gen flow compiled with TensorRT")
-
-                self.t3.speech_emb = torch.compile(self.t3.speech_emb, fullgraph=True)
-                self.t3.speech_head = torch.compile(self.t3.speech_head, fullgraph=True)
-                self._compiled = True
-                return
-            except ImportError:
-                logger.warning("torch-tensorrt not installed, falling back to static-cudagraphs")
-                mode = "static-cudagraphs"
-                return self.compile_models(mode)
-            except Exception as e:
-                logger.warning(f"TensorRT compilation failed: {e}, falling back to static-cudagraphs")
-                mode = "static-cudagraphs"
-                return self.compile_models(mode)
 
         if mode == "tensorrt":
             try:
@@ -376,7 +278,7 @@ class ChatterboxTurboTTS:
         ckpt_dir,
         device,
         dtype: str = "float32",
-        compile_mode: Optional[str] = "static-cudagraphs",
+        compile_mode: Optional[str] = "default",
     ) -> 'ChatterboxTurboTTS':
         """
         Load model from local checkpoint.
@@ -386,10 +288,9 @@ class ChatterboxTurboTTS:
             device: Device to load model on ("cuda", "cpu", "mps")
             dtype: Data type ("float32", "float16", "bfloat16")
             compile_mode: Compilation mode:
-                - "static-cudagraphs": CUDA graphs with static cache (default, fastest)
-                - "static-tensorrt": TensorRT with static cache (requires torch-tensorrt)
-                - "default": Basic torch.compile
+                - "default": Basic torch.compile (default)
                 - "max-autotune": Slower compile, faster runtime
+                - "tensorrt": TensorRT backend (requires torch-tensorrt)
                 - None: No compilation
         """
         ckpt_dir = Path(ckpt_dir)
@@ -465,7 +366,7 @@ class ChatterboxTurboTTS:
         cls,
         device: str,
         dtype: str = "float32",
-        compile_mode: Optional[str] = "static-cudagraphs",
+        compile_mode: Optional[str] = "default",
     ) -> 'ChatterboxTurboTTS':
         """
         Load model from HuggingFace Hub.
@@ -477,18 +378,17 @@ class ChatterboxTurboTTS:
                 - "float16": Half precision (faster, slight quality loss)
                 - "bfloat16": Brain float16 (faster, better precision than fp16)
             compile_mode: Compilation for faster inference
-                - "static-cudagraphs": CUDA graphs with static cache (default, fastest)
-                - "static-tensorrt": TensorRT with static cache (requires torch-tensorrt)
-                - "default": Basic torch.compile
+                - "default": Basic torch.compile (default)
                 - "max-autotune": Slowest compile, fastest runtime
+                - "tensorrt": TensorRT backend (requires torch-tensorrt)
                 - None: No compilation
 
         Example:
             # Fast inference on GPU with compilation
             model = ChatterboxTurboTTS.from_pretrained(
                 device="cuda",
-                dtype="float16",
-                compile_mode="reduce-overhead"
+                dtype="float32",
+                compile_mode="default"
             )
         """
         # Check if MPS is available on macOS
@@ -825,14 +725,10 @@ class ChatterboxTurboTTS:
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
         max_gen_len: int = 1000,
-        use_static_cache: bool = True,
     ) -> Generator[torch.Tensor, None, None]:
         """
         Streaming version of inference_turbo that yields tokens one at a time.
         Optimized for minimal overhead per token.
-
-        Args:
-            use_static_cache: Use pre-allocated static KV cache for faster generation
         """
         # Get cached logits processors
         logits_processors = self._get_logits_processors(
@@ -854,21 +750,9 @@ class ChatterboxTurboTTS:
         )
         num_generated = 0
 
-        # Setup KV cache - static cache enables CUDA graphs for faster generation
-        if use_static_cache:
-            static_cache = self._get_or_create_static_cache(batch_size=1)
-            static_cache.reset()
-            # Initial forward pass with static cache
-            llm_outputs = self.t3.tfmr(
-                inputs_embeds=embeds,
-                past_key_values=static_cache,
-                use_cache=True
-            )
-            past_key_values = static_cache  # Static cache updates in-place
-        else:
-            # Dynamic cache (original behavior)
-            llm_outputs = self.t3.tfmr(inputs_embeds=embeds, use_cache=True)
-            past_key_values = llm_outputs.past_key_values
+        # Initial forward pass with dynamic KV cache
+        llm_outputs = self.t3.tfmr(inputs_embeds=embeds, use_cache=True)
+        past_key_values = llm_outputs.past_key_values
 
         # Get first token
         speech_logits = self.t3.speech_head(llm_outputs[0][:, -1:])
@@ -883,7 +767,7 @@ class ChatterboxTurboTTS:
         current_speech_token = next_speech_token
         stop_token = self.t3.hp.stop_speech_token
 
-        # Main generation loop - optimized
+        # Main generation loop
         for _ in range(max_gen_len):
             # Embed current token
             current_speech_embed = self.t3.speech_emb(current_speech_token)
