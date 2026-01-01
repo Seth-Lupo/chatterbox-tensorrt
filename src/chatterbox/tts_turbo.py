@@ -580,7 +580,7 @@ class ChatterboxTurboTTS:
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
-        context_window: int = 50,
+        context_window: int = 200,
         fade_duration: float = 0.05,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
@@ -624,11 +624,14 @@ class ChatterboxTurboTTS:
         # Starts small for fast TTFA, gradually increases for better quality
         # Early chunks: no/minimal fade to avoid tremolo on short audio
         ramp_schedule = [
-            (8, 0, 0.0, 0.0),       # Chunk 0: no fade (start of audio)
-            (12, 8, 0.01, 0.0),     # Chunk 1: tiny fade-in only
-            (18, 20, 0.02, 0.01),   # Chunk 2: gentle crossfade
-            (chunk_size, 35, 0.03, 0.02),  # Chunk 3: building up
-            (chunk_size, context_window, fade_duration, fade_duration),  # Chunk 4+: full
+            (8, 0, 0.0, 0.0),        # Chunk 0: no fade (start of audio)
+            (12, 8, 0.01, 0.0),      # Chunk 1: tiny fade-in only
+            (18, 20, 0.02, 0.01),    # Chunk 2: gentle crossfade
+            (chunk_size, 40, 0.03, 0.02),   # Chunk 3: building up
+            (chunk_size, 60, 0.04, 0.03),   # Chunk 4
+            (chunk_size, 100, 0.05, 0.04),  # Chunk 5
+            (chunk_size, 150, fade_duration, fade_duration),  # Chunk 6
+            (chunk_size, context_window, fade_duration, fade_duration),  # Chunk 7+: full (200)
         ]
 
         # Stream tokens from T3
