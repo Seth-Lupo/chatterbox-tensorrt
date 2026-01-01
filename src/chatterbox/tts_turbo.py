@@ -607,7 +607,7 @@ class ChatterboxTurboTTS:
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
-        context_window: int = 200,
+        context_window: int = 500,
         overlap_ms: float = 50.0,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
@@ -659,11 +659,11 @@ class ChatterboxTurboTTS:
             (10, 0, overlap_samples // 4),      # Chunk 0: minimal overlap
             (15, 10, overlap_samples // 3),     # Chunk 1: growing
             (20, 25, overlap_samples // 2),     # Chunk 2: building
-            (chunk_size, 45, overlap_samples * 2 // 3),   # Chunk 3
-            (chunk_size, 70, overlap_samples * 3 // 4),   # Chunk 4
-            (chunk_size, 100, overlap_samples),           # Chunk 5: full overlap
-            (chunk_size, 150, overlap_samples),           # Chunk 6
-            (chunk_size, context_window, overlap_samples),  # Chunk 7+: full
+            (chunk_size, 50, overlap_samples * 2 // 3),   # Chunk 3
+            (chunk_size, 100, overlap_samples * 3 // 4),  # Chunk 4
+            (chunk_size, 200, overlap_samples),           # Chunk 5
+            (chunk_size, 350, overlap_samples),           # Chunk 6
+            (chunk_size, context_window, overlap_samples),  # Chunk 7+: full (500)
         ]
 
         # Stream tokens from T3
