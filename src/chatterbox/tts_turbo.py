@@ -188,18 +188,59 @@ class ChatterboxTurboTTS:
 
         if mode == "tensorrt":
             import torch_tensorrt
-            self.s3gen.flow = torch.compile(
-                self.s3gen.flow,
-                backend="torch_tensorrt",
-                options={
-                    "truncate_long_and_double": True,
-                    "enabled_precisions": {torch.float16, torch.float32},
-                    "debug": False,
-                    "min_block_size": 1,
-                    "use_python_runtime": False,
-                }
-            )
-            logger.info("S3Gen compiled with TensorRT backend")
+            import logging as py_logging
+
+            # Enable TensorRT debug logging to verify compilation
+            trt_logger = py_logging.getLogger("torch_tensorrt")
+            trt_logger.setLevel(py_logging.INFO)
+
+            # Compile the decoder's estimator (ConditionalDecoder) - this is the heavy compute
+            logger.info("Compiling S3Gen decoder estimator with TensorRT backend...")
+
+            try:
+                self.s3gen.flow.decoder.estimator = torch.compile(
+                    self.s3gen.flow.decoder.estimator,
+                    backend="torch_tensorrt",
+                    options={
+                        "truncate_long_and_double": True,
+                        "enabled_precisions": {torch.float16, torch.float32},
+                        "debug": True,  # Enable debug to see TRT compilation
+                        "min_block_size": 1,
+                        "use_python_runtime": False,
+                    }
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to set up TensorRT compilation: {e}") from e
+
+            # Force compilation with warmup - this triggers actual TRT engine build
+            logger.info("Building TensorRT engine (this may take a minute)...")
+            try:
+                with torch.inference_mode():
+                    # Match ConditionalDecoder.forward signature exactly
+                    dummy_x = torch.randn(1, 80, 100, device=self.device, dtype=self.dtype)
+                    dummy_mask = torch.ones(1, 1, 100, device=self.device, dtype=self.dtype)
+                    dummy_mu = torch.randn(1, 80, 100, device=self.device, dtype=self.dtype)
+                    dummy_t = torch.tensor([0.5], device=self.device, dtype=self.dtype)
+                    dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
+                    dummy_cond = torch.randn(1, 80, 100, device=self.device, dtype=self.dtype)
+                    dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
+
+                    # First forward triggers compilation
+                    _ = self.s3gen.flow.decoder.estimator(
+                        dummy_x, mask=dummy_mask, mu=dummy_mu, t=dummy_t,
+                        spks=dummy_spks, cond=dummy_cond, r=dummy_r
+                    )
+                    torch.cuda.synchronize()
+
+                logger.info("TensorRT engine built successfully for S3Gen decoder")
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"TensorRT compilation FAILED for S3Gen decoder.\n"
+                    f"This is a hard failure - TensorRT is required.\n"
+                    f"Ensure torch-tensorrt is properly installed.\n"
+                    f"Error: {e}"
+                ) from e
         else:
             compile_kwargs = {"dynamic": True}
             if mode == "max-autotune":
