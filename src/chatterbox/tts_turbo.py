@@ -499,6 +499,7 @@ class ChatterboxTurboTTS:
         metrics: StreamingMetrics,
         prev_tail: Optional[np.ndarray],
         crossfade_ms: float = 5.0,
+        cfm_steps: int = 5,
     ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
         """Process a chunk of tokens and return audio with optional crossfade."""
         # Build tokens_to_process by including context window
@@ -525,7 +526,7 @@ class ChatterboxTurboTTS:
         wav, _ = self.s3gen.inference(
             speech_tokens=tokens_to_process,
             ref_dict=self.conds.gen,
-            n_cfm_timesteps=2,
+            n_cfm_timesteps=cfm_steps,
         )
         wav = wav.squeeze(0).detach().cpu().numpy()
 
@@ -580,6 +581,7 @@ class ChatterboxTurboTTS:
         chunk_size: int = 25,
         context_window: int = 500,
         crossfade_ms: float = 5.0,
+        cfm_steps: int = 5,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
@@ -597,6 +599,7 @@ class ChatterboxTurboTTS:
             chunk_size: Target tokens for chunks after ramp-up (default 25)
             context_window: Max context tokens for audio coherence (default 500)
             crossfade_ms: Crossfade duration in ms to smooth chunk boundaries (default 5ms)
+            cfm_steps: CFM diffusion steps for vocoder (default 2, try 4-10 for better quality)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
@@ -654,7 +657,7 @@ class ChatterboxTurboTTS:
 
                     audio_tensor, audio_duration, success, prev_tail = self._process_token_chunk(
                         new_tokens, all_tokens, current_context, start_time, metrics,
-                        prev_tail, crossfade_ms
+                        prev_tail, crossfade_ms, cfm_steps
                     )
 
                     if success:
@@ -674,7 +677,7 @@ class ChatterboxTurboTTS:
 
                 audio_tensor, audio_duration, success, _ = self._process_token_chunk(
                     new_tokens, all_tokens, current_context, start_time, metrics,
-                    prev_tail, crossfade_ms
+                    prev_tail, crossfade_ms, cfm_steps
                 )
 
                 if success:
