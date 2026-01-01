@@ -170,7 +170,8 @@ class ChatterboxTurboTTS:
 
     def compile_models(self, mode: str = "default"):
         """
-        Compile models for faster inference.
+        Compile S3Gen model for faster inference.
+        T3 is kept as default (uncompiled) for stability.
 
         Args:
             mode: Compilation mode
@@ -183,7 +184,7 @@ class ChatterboxTurboTTS:
             logger.warning("Models already compiled, skipping")
             return
 
-        logger.info(f"Compiling models with mode: {mode}")
+        logger.info(f"Compiling S3Gen with mode: {mode} (T3 kept as default)")
 
         # Use dynamic=True to avoid recompilation on different input shapes
         compile_kwargs = {"dynamic": True}
@@ -191,13 +192,9 @@ class ChatterboxTurboTTS:
         if mode == "max-autotune":
             compile_kwargs["mode"] = "max-autotune"
 
-        # Compile T3 transformer and components
-        self.t3.tfmr = torch.compile(self.t3.tfmr, **compile_kwargs)
-        self.t3.speech_emb = torch.compile(self.t3.speech_emb, **compile_kwargs)
-        self.t3.speech_head = torch.compile(self.t3.speech_head, **compile_kwargs)
-        # Compile S3Gen flow model
+        # Only compile S3Gen flow model - keep T3 as default for stability
         self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-        logger.info(f"Models compiled with torch.compile (dynamic=True, mode={mode})")
+        logger.info(f"S3Gen compiled with torch.compile (dynamic=True, mode={mode})")
 
         self._compiled = True
 
