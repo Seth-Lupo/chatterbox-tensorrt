@@ -40,6 +40,21 @@ logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox-turbo"
 
+# Default ramp schedule: (chunk_tokens, context_tokens, cfm_steps)
+# Starts fast with small chunks, ramps up to full quality
+DEFAULT_RAMP_SCHEDULE = [
+    (4, 0, 1),      # Chunk 0: 4 tokens, 0 context, 1 CFM step (fast first chunk)
+    (8, 4, 3),      # Chunk 1: 8 tokens, 4 context, 3 CFM steps
+    (16, 12, 5),    # Chunk 2: 16 tokens, 12 context, 5 CFM steps
+    (32, 28, 7),    # Chunk 3: 32 tokens, 28 context, 7 CFM steps
+    (32, 60, 7),    # Chunk 4+: 32 tokens, growing context
+    (32, 125, 7),
+    (32, 200, 7),
+]
+
+# Type alias for ramp schedule
+RampSchedule = List[Tuple[int, int, int]]
+
 
 # =============================================================================
 # Utilities
@@ -420,10 +435,8 @@ class ChatterboxTurboTTS:
         top_k: int = 1000,
         top_p: float = 0.95,
         repetition_penalty: float = 1.2,
-        chunk_size: int = 25,
-        context_window: int = 500,
         crossfade_ms: float = 20.0,
-        cfm_steps: int = 5,
+        ramp_schedule: Optional[RampSchedule] = None,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
@@ -436,10 +449,9 @@ class ChatterboxTurboTTS:
             top_k: Top-k sampling parameter
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Repetition penalty
-            chunk_size: Target tokens per chunk after ramp-up
-            context_window: Max context tokens for audio coherence
             crossfade_ms: Crossfade duration in ms for smooth chunk boundaries
-            cfm_steps: CFM diffusion steps for vocoder
+            ramp_schedule: List of (chunk_tokens, context_tokens, cfm_steps) tuples.
+                          Defaults to DEFAULT_RAMP_SCHEDULE.
 
         Yields:
             Tuple of (audio_chunk, metrics)
@@ -461,16 +473,8 @@ class ChatterboxTurboTTS:
         chunk_buffer = []
         prev_tail: Optional[np.ndarray] = None
 
-        # Dynamic ramp-up schedule: [chunk_size, context_window, cfm_steps]
-        ramp_schedule = [
-            (4, 0, 1),      # Chunk 0: fast first chunk
-            (8, 4, 3),      # Chunk 1
-            (16, 12, 5),    # Chunk 2
-            (32, 28, 7),    # Chunk 3
-            (32, 60, 7),    # Chunk 4
-            (32, 125, 7),   # Chunk 5
-            (32, 200, 7),   # Chunk 6+
-        ]
+        # Use provided schedule or default
+        schedule = ramp_schedule if ramp_schedule is not None else DEFAULT_RAMP_SCHEDULE
 
         with torch.inference_mode():
             for token in self._stream_tokens(
@@ -478,8 +482,8 @@ class ChatterboxTurboTTS:
             ):
                 chunk_buffer.append(token)
 
-                schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                current_chunk_size, current_context, current_cfm = ramp_schedule[schedule_idx]
+                schedule_idx = min(metrics.chunk_count, len(schedule) - 1)
+                current_chunk_size, current_context, current_cfm = schedule[schedule_idx]
 
                 if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
@@ -499,8 +503,8 @@ class ChatterboxTurboTTS:
             # Process remaining tokens
             if chunk_buffer:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
-                schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                _, current_context, current_cfm = ramp_schedule[schedule_idx]
+                schedule_idx = min(metrics.chunk_count, len(schedule) - 1)
+                _, current_context, current_cfm = schedule[schedule_idx]
 
                 audio_tensor, audio_duration, success, prev_tail = self._process_chunk(
                     new_tokens, all_tokens, current_context, start_time, metrics,
@@ -926,6 +930,7 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         crossfade_ms: float = 20.0,
         max_len: int = 1000,
+        ramp_schedule: Optional[RampSchedule] = None,
     ) -> Generator[List[BatchedChunkResult], None, None]:
         """
         Batched streaming TTS generation for multiple sequences in parallel.
@@ -943,6 +948,8 @@ class ChatterboxTurboTTS:
             repetition_penalty: Repetition penalty
             crossfade_ms: Crossfade duration in ms
             max_len: Maximum tokens per sequence
+            ramp_schedule: List of (chunk_tokens, context_tokens, cfm_steps) tuples.
+                          Defaults to DEFAULT_RAMP_SCHEDULE.
 
         Yields:
             List of BatchedChunkResult for sequences that have ready chunks
@@ -957,23 +964,15 @@ class ChatterboxTurboTTS:
 
         processors = self._get_logits_processors(temperature, top_k, top_p, repetition_penalty)
 
-        # Ramp schedule
-        ramp_schedule = [
-            (4, 0, 1),
-            (8, 4, 3),
-            (16, 12, 5),
-            (32, 28, 7),
-            (32, 60, 7),
-            (32, 125, 7),
-            (32, 200, 7),
-        ]
+        # Use provided schedule or default
+        schedule = ramp_schedule if ramp_schedule is not None else DEFAULT_RAMP_SCHEDULE
 
         with torch.inference_mode():
             # Initial forward pass for all sequences
             self._batched_initial_forward(states, temperature, top_k, top_p, repetition_penalty)
 
             # Check for initial chunks
-            results = self._collect_ready_chunks(states, ramp_schedule, crossfade_ms)
+            results = self._collect_ready_chunks(states, schedule, crossfade_ms)
             if results:
                 yield results
 
@@ -984,12 +983,12 @@ class ChatterboxTurboTTS:
                     break
 
                 # Check for ready chunks
-                results = self._collect_ready_chunks(states, ramp_schedule, crossfade_ms)
+                results = self._collect_ready_chunks(states, schedule, crossfade_ms)
                 if results:
                     yield results
 
             # Flush remaining buffers
-            results = self._flush_remaining_chunks(states, ramp_schedule, crossfade_ms)
+            results = self._flush_remaining_chunks(states, schedule, crossfade_ms)
             if results:
                 yield results
 
