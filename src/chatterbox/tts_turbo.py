@@ -502,7 +502,7 @@ class ChatterboxTurboTTS:
         start_time: float,
         metrics: StreamingMetrics,
         prev_tail: Optional[np.ndarray],
-        crossfade_ms: float = 5.0,
+        crossfade_ms: float = 12.0,
         cfm_steps: int = 5,
     ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
         """Process a chunk of tokens and return audio with optional crossfade."""
@@ -540,6 +540,16 @@ class ChatterboxTurboTTS:
         if context_length > 0:
             samples_per_token = len(wav) / len(tokens_to_process)
             skip_samples = int(context_length * samples_per_token)
+
+            # Find nearest zero-crossing to cut cleanly (reduces clicks)
+            search_range = min(100, len(wav) - skip_samples - 1)  # ~4ms at 24kHz
+            if search_range > 10:
+                search_region = wav[skip_samples:skip_samples + search_range]
+                # Find where sign changes (zero crossings)
+                zero_crossings = np.where(np.diff(np.signbit(search_region)))[0]
+                if len(zero_crossings) > 0:
+                    skip_samples += zero_crossings[0]
+
             audio_chunk = wav[skip_samples:]
         else:
             audio_chunk = wav
@@ -547,15 +557,25 @@ class ChatterboxTurboTTS:
         if len(audio_chunk) == 0:
             return None, 0.0, False, prev_tail
 
-        # Simple crossfade to eliminate crackles at chunk boundaries
+        # Crossfade to eliminate crackles at chunk boundaries
         crossfade_samples = int(crossfade_ms * self.sr / 1000)
 
         if prev_tail is not None and crossfade_samples > 0:
             blend_len = min(crossfade_samples, len(prev_tail), len(audio_chunk))
             if blend_len > 0:
-                # Linear crossfade (simple and effective)
-                fade_out = np.linspace(1.0, 0.0, blend_len, dtype=audio_chunk.dtype)
-                fade_in = np.linspace(0.0, 1.0, blend_len, dtype=audio_chunk.dtype)
+                # Check if we're in a low-energy (silence) region - need more blending
+                tail_energy = np.mean(np.abs(prev_tail[-blend_len:]))
+                head_energy = np.mean(np.abs(audio_chunk[:blend_len]))
+                is_low_energy = (tail_energy < 0.01) or (head_energy < 0.01)
+
+                # Use longer blend for silence regions (where clicks are most audible)
+                if is_low_energy:
+                    blend_len = min(blend_len * 3, len(prev_tail), len(audio_chunk))
+
+                # Equal-power crossfade (better than linear for audio)
+                t = np.linspace(0, np.pi / 2, blend_len, dtype=audio_chunk.dtype)
+                fade_out = np.cos(t)  # 1 -> 0
+                fade_in = np.sin(t)   # 0 -> 1
 
                 # Blend the overlap region
                 blended = prev_tail[-blend_len:] * fade_out + audio_chunk[:blend_len] * fade_in
@@ -597,7 +617,7 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
         context_window: int = 500,
-        crossfade_ms: float = 5.0,
+        crossfade_ms: float = 12.0,
         cfm_steps: int = 5,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
@@ -640,17 +660,18 @@ class ChatterboxTurboTTS:
         prev_tail: Optional[np.ndarray] = None
 
         # Dynamic ramp-up schedule: [chunk_size, context_window, cfm_steps]
-        # Tokens double: 4 → 8 → 16 → 32
+        # Tokens double: 2 → 4 → 8 → 16 → 32
         # CFM steps: 2 → 4 → 6 → 8
+        # Context capped at 200
         ramp_schedule = [
-            (4, 0, 2),         # Chunk 0: fast first chunk
-            (8, 4, 4),         # Chunk 1: doubling
-            (16, 12, 6),       # Chunk 2: doubling
-            (32, 28, 8),       # Chunk 3: max tokens, max CFM
-            (32, 60, 8),       # Chunk 4+: steady state
-            (32, 125, 8),      # Chunk 5
-            (32, 250, 8),      # Chunk 6
-            (32, context_window, 8),  # Chunk 7+: full context (500)
+            (2, 0, 2),         # Chunk 0: ultra-fast first chunk
+            (4, 2, 4),         # Chunk 1: doubling
+            (8, 6, 6),         # Chunk 2: doubling
+            (16, 14, 8),       # Chunk 3: doubling
+            (32, 30, 8),       # Chunk 4: max tokens
+            (32, 60, 8),       # Chunk 5
+            (32, 125, 8),      # Chunk 6
+            (32, 200, 8),      # Chunk 7+: capped at 200
         ]
 
         # Stream tokens from T3
