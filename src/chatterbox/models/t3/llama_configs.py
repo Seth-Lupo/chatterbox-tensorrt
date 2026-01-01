@@ -38,6 +38,7 @@ GPT2_MEDIUM_CONFIG = {
     "GPT2LMHeadModel"
   ],
   "attn_pdrop": 0.1,
+  "attn_implementation": "sdpa",  # Enable Flash Attention via SDPA
   "bos_token_id": 50256,
   "embd_pdrop": 0.1,
   "eos_token_id": 50256,
