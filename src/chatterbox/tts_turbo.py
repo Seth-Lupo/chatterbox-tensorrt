@@ -490,22 +490,15 @@ class ChatterboxTurboTTS:
         wav = wav.squeeze(0).detach().cpu()
         return wav.unsqueeze(0)
 
-    def _process_token_chunk_ola(
+    def _process_token_chunk(
         self,
         new_tokens: torch.Tensor,
         all_tokens_so_far: torch.Tensor,
         context_window: int,
         start_time: float,
         metrics: StreamingMetrics,
-        prev_chunk_tail: Optional[np.ndarray],
-        overlap_samples: int = 1200,  # 50ms at 24kHz
-    ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
-        """
-        Process a chunk of tokens with Overlap-Add (OLA) for seamless blending.
-
-        Uses Hann windowing on overlap regions for smooth transitions without clicks.
-        Returns: (audio_tensor, duration, success, new_tail_for_next_chunk)
-        """
+    ) -> Tuple[Optional[torch.Tensor], float, bool]:
+        """Process a chunk of tokens and return audio."""
         # Build tokens_to_process by including context window
         if len(all_tokens_so_far) > 0:
             context_tokens = (
@@ -522,7 +515,7 @@ class ChatterboxTurboTTS:
         # Filter invalid tokens
         tokens_to_process = tokens_to_process[tokens_to_process < 6561]
         if len(tokens_to_process) == 0:
-            return None, 0.0, False, prev_chunk_tail
+            return None, 0.0, False
 
         tokens_to_process = tokens_to_process.to(self.device)
 
@@ -543,48 +536,7 @@ class ChatterboxTurboTTS:
             audio_chunk = wav
 
         if len(audio_chunk) == 0:
-            return None, 0.0, False, prev_chunk_tail
-
-        # ============================================================
-        # Overlap-Add (OLA) with Hann windowing for seamless blending
-        # ============================================================
-
-        # Adjust overlap based on chunk size (smaller chunks = smaller overlap)
-        actual_overlap = min(overlap_samples, len(audio_chunk) // 3)
-
-        if prev_chunk_tail is not None and actual_overlap > 0:
-            # Create Hann window for smooth crossfade
-            # Hann window: w(n) = 0.5 * (1 - cos(2*pi*n/(N-1)))
-            hann = np.hanning(actual_overlap * 2).astype(audio_chunk.dtype)
-            fade_out = hann[:actual_overlap]  # First half: 0 -> 1 -> ~0.5
-            fade_in = hann[actual_overlap:]   # Second half: ~0.5 -> 1 -> 0
-
-            # Actually we want complementary fades that sum to 1
-            # fade_out: 1 -> 0, fade_in: 0 -> 1
-            fade_out = np.sqrt(0.5 * (1 + np.cos(np.linspace(0, np.pi, actual_overlap)))).astype(audio_chunk.dtype)
-            fade_in = np.sqrt(0.5 * (1 - np.cos(np.linspace(0, np.pi, actual_overlap)))).astype(audio_chunk.dtype)
-
-            # Ensure prev_chunk_tail has enough samples
-            tail_len = len(prev_chunk_tail)
-            if tail_len >= actual_overlap:
-                # Blend: apply fade_out to tail, fade_in to head, then add
-                blended_region = (
-                    prev_chunk_tail[-actual_overlap:] * fade_out +
-                    audio_chunk[:actual_overlap] * fade_in
-                )
-                # Build output: blended region + rest of current chunk
-                audio_chunk = np.concatenate([blended_region, audio_chunk[actual_overlap:]])
-            else:
-                # Not enough tail, just do simple crossfade with what we have
-                blend_len = min(tail_len, actual_overlap, len(audio_chunk))
-                if blend_len > 0:
-                    fade_out_short = np.sqrt(0.5 * (1 + np.cos(np.linspace(0, np.pi, blend_len)))).astype(audio_chunk.dtype)
-                    fade_in_short = np.sqrt(0.5 * (1 - np.cos(np.linspace(0, np.pi, blend_len)))).astype(audio_chunk.dtype)
-                    blended = prev_chunk_tail[-blend_len:] * fade_out_short + audio_chunk[:blend_len] * fade_in_short
-                    audio_chunk = np.concatenate([blended, audio_chunk[blend_len:]])
-
-        # Save tail for next chunk's overlap-add
-        new_tail = audio_chunk[-overlap_samples:].copy() if len(audio_chunk) >= overlap_samples else audio_chunk.copy()
+            return None, 0.0, False
 
         # Compute audio duration
         audio_duration = len(audio_chunk) / self.sr
@@ -595,7 +547,7 @@ class ChatterboxTurboTTS:
             metrics.latency_to_first_chunk = time.time() - start_time
 
         metrics.chunk_count += 1
-        return audio_tensor, audio_duration, True, new_tail
+        return audio_tensor, audio_duration, True
 
     def generate_stream(
         self,
