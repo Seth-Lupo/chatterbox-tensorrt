@@ -2,7 +2,7 @@
 """
 Benchmark: Optimized Chatterbox Turbo with torch.compile
 
-Tests time-to-first-audio latency with fp32 and torch.compile optimization.
+Tests time-to-first-audio latency with fp16 and torch.compile optimization.
 
 Usage:
     python benchmark_compile.py
@@ -112,7 +112,7 @@ def main():
     args = parser.parse_args()
 
     print("="*60)
-    print("Chatterbox Turbo - Optimized Benchmark (FP32)")
+    print("Chatterbox Turbo - Optimized Benchmark (FP16)")
     print("="*60)
 
     # GPU info
@@ -128,7 +128,7 @@ def main():
         print("ERROR: CUDA not available")
         sys.exit(1)
 
-    print(f"Dtype: float32")
+    print(f"Dtype: float16")
     print(f"Compile mode: {args.compile_mode}")
     print(f"Iterations: {args.iterations}")
     print(f"Audio prompt: {args.audio_prompt or 'None (using default voice)'}")
@@ -137,13 +137,13 @@ def main():
     # Load optimized model
     # =========================================================================
     print("\n" + "="*60)
-    print(f"Loading model with fp32 + torch.compile({args.compile_mode})...")
+    print(f"Loading model with fp16 + torch.compile({args.compile_mode})...")
     print("="*60)
 
     load_start = time.perf_counter()
     model = ChatterboxTurboTTS.from_pretrained(
         device="cuda",
-        dtype="float32",
+        dtype="float16",
         compile_mode=args.compile_mode,
     )
     load_time = time.perf_counter() - load_start
@@ -152,7 +152,7 @@ def main():
     # Run benchmark
     results = run_benchmark(
         model,
-        f"FP32 + torch.compile({args.compile_mode})",
+        f"FP16 + torch.compile({args.compile_mode})",
         args.iterations,
         args.audio_prompt
     )
@@ -164,7 +164,7 @@ def main():
     print("BENCHMARK RESULTS")
     print("="*60)
 
-    print(f"\nConfiguration: FP32 + torch.compile({args.compile_mode})")
+    print(f"\nConfiguration: FP16 + torch.compile({args.compile_mode})")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("-"*60)
     print(f"  Mean latency:   {results['mean']:.3f}s")
@@ -190,9 +190,10 @@ def main():
     # Save sample output
     # =========================================================================
     print(f"\nGenerating sample audio to {args.output}...")
+    sample_text = "Hello, this is a comprehensive test of the Chatterbox text to speech system. We are testing the streaming audio generation pipeline with torch compile optimizations enabled. The goal is to achieve low latency to first audio chunk while maintaining high quality speech synthesis. This longer sample helps verify that the full pipeline is working correctly from start to finish."
     audio_chunks = []
     for chunk, _ in model.generate_stream(
-        text=TEST_TEXTS[0],
+        text=sample_text,
         audio_prompt_path=args.audio_prompt,
         chunk_size=25,
         context_window=50,
