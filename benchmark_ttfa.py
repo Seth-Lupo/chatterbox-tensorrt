@@ -154,8 +154,9 @@ def main():
         help="Model precision"
     )
     parser.add_argument(
-        "--compile", action="store_true",
-        help="Enable torch.compile for S3Gen"
+        "--compile-mode", type=str, default="default",
+        choices=["none", "default", "reduce-overhead", "max-autotune", "tensorrt"],
+        help="Compilation mode for S3Gen (default: default)"
     )
     parser.add_argument(
         "--warmup", type=int, default=3,
@@ -180,11 +181,12 @@ def main():
     args = parser.parse_args()
 
     # Load model
+    compile_mode = None if args.compile_mode == "none" else args.compile_mode
     print(f"\nLoading model on {args.device} with {args.dtype}...")
     model = ChatterboxTurboTTS.from_pretrained(
         device=args.device,
         dtype=args.dtype,
-        compile_mode="default" if args.compile else None,
+        compile_mode=compile_mode,
     )
 
     # Prepare voice conditionals if provided
@@ -192,7 +194,7 @@ def main():
         print(f"Loading voice reference: {args.audio_prompt}")
         model.prepare_conditionals(args.audio_prompt)
 
-    print(f"Model loaded. Compile: {args.compile}")
+    print(f"Model loaded. Compile mode: {args.compile_mode}")
     print(f"Warmup runs: {args.warmup}, Benchmark runs: {args.runs}")
     print(f"Chunk size: {args.chunk_size} tokens")
 
@@ -227,7 +229,7 @@ def main():
     print("-" * 60)
     print(f"  Device:     {args.device}")
     print(f"  Dtype:      {args.dtype}")
-    print(f"  Compiled:   {args.compile}")
+    print(f"  Compile:    {args.compile_mode}")
     print(f"  Chunk size: {args.chunk_size}")
     if torch.cuda.is_available():
         print(f"  GPU:        {torch.cuda.get_device_name(0)}")
