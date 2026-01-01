@@ -500,7 +500,8 @@ class ChatterboxTurboTTS:
         context_window: int,
         start_time: float,
         metrics: StreamingMetrics,
-        fade_duration: float = 0.02,
+        fade_in_duration: float = 0.02,
+        fade_out_duration: float = 0.02,
     ) -> Tuple[Optional[torch.Tensor], float, bool]:
         """Process a chunk of tokens and return audio."""
         # Build tokens_to_process by including context window
@@ -543,16 +544,20 @@ class ChatterboxTurboTTS:
             return None, 0.0, False
 
         # Apply smooth crossfade to reduce glitching at chunk boundaries
-        fade_samples = int(fade_duration * self.sr)
-        if fade_samples > 0 and fade_samples < len(audio_chunk) // 2:
-            # Use cosine curve for smoother transitions (less audible than linear)
-            t = np.linspace(0.0, np.pi / 2, fade_samples, dtype=audio_chunk.dtype)
-            fade_in = np.sin(t)  # 0 -> 1 smoothly
-            fade_out = np.cos(t)  # 1 -> 0 smoothly
+        # Separate fade-in and fade-out to avoid tremolo on short chunks
+        fade_in_samples = int(fade_in_duration * self.sr)
+        fade_out_samples = int(fade_out_duration * self.sr)
 
-            # Apply fade-in at start and fade-out at end
-            audio_chunk[:fade_samples] *= fade_in
-            audio_chunk[-fade_samples:] *= fade_out
+        # Only apply fades if they fit within the chunk
+        if fade_in_samples > 0 and fade_in_samples < len(audio_chunk) // 2:
+            t = np.linspace(0.0, np.pi / 2, fade_in_samples, dtype=audio_chunk.dtype)
+            fade_in = np.sin(t)  # 0 -> 1 smoothly
+            audio_chunk[:fade_in_samples] *= fade_in
+
+        if fade_out_samples > 0 and fade_out_samples < len(audio_chunk) // 2:
+            t = np.linspace(0.0, np.pi / 2, fade_out_samples, dtype=audio_chunk.dtype)
+            fade_out = np.cos(t)  # 1 -> 0 smoothly
+            audio_chunk[-fade_out_samples:] *= fade_out
 
         # Compute audio duration
         audio_duration = len(audio_chunk) / self.sr
@@ -615,14 +620,15 @@ class ChatterboxTurboTTS:
         all_tokens = torch.tensor([], dtype=torch.long, device=self.device)
         chunk_buffer = []
 
-        # Dynamic ramp-up schedule: [chunk_size, context_window, fade_duration]
+        # Dynamic ramp-up schedule: [chunk_size, context_window, fade_in, fade_out]
         # Starts small for fast TTFA, gradually increases for better quality
+        # Early chunks: no/minimal fade to avoid tremolo on short audio
         ramp_schedule = [
-            (8, 0, 0.03),      # Chunk 0: tiny, no context, short fade (fast TTFA)
-            (12, 8, 0.04),     # Chunk 1: small, minimal context
-            (18, 20, 0.05),    # Chunk 2: medium, growing context
-            (chunk_size, 35, fade_duration),  # Chunk 3: larger
-            (chunk_size, context_window, fade_duration),  # Chunk 4+: full params
+            (8, 0, 0.0, 0.0),       # Chunk 0: no fade (start of audio)
+            (12, 8, 0.01, 0.0),     # Chunk 1: tiny fade-in only
+            (18, 20, 0.02, 0.01),   # Chunk 2: gentle crossfade
+            (chunk_size, 35, 0.03, 0.02),  # Chunk 3: building up
+            (chunk_size, context_window, fade_duration, fade_duration),  # Chunk 4+: full
         ]
 
         # Stream tokens from T3
@@ -639,14 +645,15 @@ class ChatterboxTurboTTS:
 
                 # Get dynamic parameters based on chunk count (ramp up over time)
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                current_chunk_size, current_context, current_fade = ramp_schedule[schedule_idx]
+                current_chunk_size, current_context, fade_in, fade_out = ramp_schedule[schedule_idx]
 
                 # When we have enough tokens, process and yield audio
                 if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
 
                     audio_tensor, audio_duration, success = self._process_token_chunk(
-                        new_tokens, all_tokens, current_context, start_time, metrics, current_fade
+                        new_tokens, all_tokens, current_context, start_time, metrics,
+                        fade_in_duration=fade_in, fade_out_duration=fade_out
                     )
 
                     if success:
@@ -660,12 +667,13 @@ class ChatterboxTurboTTS:
             # Process remaining tokens in buffer
             if chunk_buffer:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
-                # Use full context/fade for final chunk
+                # Use current schedule for final chunk
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
-                _, current_context, current_fade = ramp_schedule[schedule_idx]
+                _, current_context, fade_in, fade_out = ramp_schedule[schedule_idx]
 
                 audio_tensor, audio_duration, success = self._process_token_chunk(
-                    new_tokens, all_tokens, current_context, start_time, metrics, current_fade
+                    new_tokens, all_tokens, current_context, start_time, metrics,
+                    fade_in_duration=fade_in, fade_out_duration=fade_out
                 )
 
                 if success:
