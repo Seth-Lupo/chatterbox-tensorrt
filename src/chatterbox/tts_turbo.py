@@ -184,41 +184,37 @@ class ChatterboxTurboTTS:
             logger.warning("Models already compiled, skipping")
             return
 
-        logger.info(f"Compiling S3Gen with mode: {mode} (T3 kept as default)")
-
         if mode == "tensorrt":
             import torch_tensorrt
             import logging as py_logging
+            import warnings
 
-            # Enable TensorRT debug logging to verify compilation
-            trt_logger = py_logging.getLogger("torch_tensorrt")
-            trt_logger.setLevel(py_logging.INFO)
-
-            # Compile the decoder's estimator (ConditionalDecoder) - this is the heavy compute
-            logger.info("Compiling S3Gen decoder estimator with TensorRT backend...")
+            # Suppress verbose TensorRT logging
+            py_logging.getLogger("torch_tensorrt").setLevel(py_logging.WARNING)
+            py_logging.getLogger("torch._dynamo").setLevel(py_logging.WARNING)
+            py_logging.getLogger("torch._inductor").setLevel(py_logging.WARNING)
+            warnings.filterwarnings("ignore", category=UserWarning)
 
             try:
                 self.s3gen.flow.decoder.estimator = torch.compile(
                     self.s3gen.flow.decoder.estimator,
                     backend="torch_tensorrt",
-                    dynamic=False,  # Use static shapes to avoid infinity issue
+                    dynamic=False,
                     options={
                         "truncate_long_and_double": True,
                         "enabled_precisions": {torch.float16, torch.float32},
-                        "debug": True,
+                        "debug": False,
                         "min_block_size": 1,
                         "use_python_runtime": False,
                     }
                 )
             except Exception as e:
-                raise RuntimeError(f"Failed to set up TensorRT compilation: {e}") from e
+                raise RuntimeError(f"TensorRT setup failed: {e}") from e
 
-            # Force compilation with warmup - triggers actual TRT engine build
-            logger.info("Building TensorRT engine (this may take a minute)...")
+            # Warmup to trigger engine build
             try:
                 with torch.inference_mode():
-                    # Use fixed shape for initial compilation
-                    seq_len = 200  # Typical sequence length
+                    seq_len = 200
                     dummy_x = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
                     dummy_mask = torch.ones(1, 1, seq_len, device=self.device, dtype=self.dtype)
                     dummy_mu = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
@@ -226,23 +222,13 @@ class ChatterboxTurboTTS:
                     dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
                     dummy_cond = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
                     dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
-
-                    # First forward triggers compilation
                     _ = self.s3gen.flow.decoder.estimator(
                         dummy_x, mask=dummy_mask, mu=dummy_mu, t=dummy_t,
                         spks=dummy_spks, cond=dummy_cond, r=dummy_r
                     )
                     torch.cuda.synchronize()
-
-                logger.info("TensorRT engine built successfully for S3Gen decoder")
-
             except Exception as e:
-                raise RuntimeError(
-                    f"TensorRT compilation FAILED for S3Gen decoder.\n"
-                    f"This is a hard failure - TensorRT is required.\n"
-                    f"Ensure torch-tensorrt is properly installed.\n"
-                    f"Error: {e}"
-                ) from e
+                raise RuntimeError(f"TensorRT compilation failed: {e}") from e
         else:
             compile_kwargs = {"dynamic": True}
             if mode == "max-autotune":
@@ -250,7 +236,6 @@ class ChatterboxTurboTTS:
             elif mode == "reduce-overhead":
                 compile_kwargs["mode"] = "reduce-overhead"
             self.s3gen.flow = torch.compile(self.s3gen.flow, **compile_kwargs)
-            logger.info(f"S3Gen compiled with torch.compile (mode={mode})")
 
         self._compiled = True
 
