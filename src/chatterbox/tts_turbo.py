@@ -498,6 +498,7 @@ class ChatterboxTurboTTS:
         start_time: float,
         metrics: StreamingMetrics,
         fade_duration: float = 0.02,
+        is_first_chunk: bool = False,
     ) -> Tuple[Optional[torch.Tensor], float, bool]:
         """Process a chunk of tokens and return audio."""
         # Build tokens_to_process by including context window
@@ -520,11 +521,12 @@ class ChatterboxTurboTTS:
 
         tokens_to_process = tokens_to_process.to(self.device)
 
-        # Run S3Gen inference
+        # Run S3Gen inference - use fewer CFM steps for first chunk (faster TTFA)
+        n_cfm_timesteps = 1 if is_first_chunk else 2
         wav, _ = self.s3gen.inference(
             speech_tokens=tokens_to_process,
             ref_dict=self.conds.gen,
-            n_cfm_timesteps=2,
+            n_cfm_timesteps=n_cfm_timesteps,
         )
         wav = wav.squeeze(0).detach().cpu().numpy()
 
@@ -619,9 +621,11 @@ class ChatterboxTurboTTS:
                 # When we have enough tokens, process and yield audio
                 if len(chunk_buffer) >= chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
+                    is_first_chunk = metrics.chunk_count == 0
 
                     audio_tensor, audio_duration, success = self._process_token_chunk(
-                        new_tokens, all_tokens, context_window, start_time, metrics, fade_duration
+                        new_tokens, all_tokens, context_window, start_time, metrics, fade_duration,
+                        is_first_chunk=is_first_chunk,
                     )
 
                     if success:
@@ -635,9 +639,11 @@ class ChatterboxTurboTTS:
             # Process remaining tokens in buffer
             if chunk_buffer:
                 new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
+                is_first_chunk = metrics.chunk_count == 0
 
                 audio_tensor, audio_duration, success = self._process_token_chunk(
-                    new_tokens, all_tokens, context_window, start_time, metrics, fade_duration
+                    new_tokens, all_tokens, context_window, start_time, metrics, fade_duration,
+                    is_first_chunk=is_first_chunk,
                 )
 
                 if success:
