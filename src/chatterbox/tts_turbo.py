@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
+from scipy.io import wavfile as scipy_wav
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
@@ -263,15 +264,25 @@ class ChatterboxTurboTTS:
         Prepare voice conditioning from a reference audio file.
 
         Args:
-            wav_fpath: Path to reference audio (must be >5 seconds)
+            wav_fpath: Path to reference audio (must be >5 seconds, .wav format)
             exaggeration: Emotion exaggeration factor
         """
-        wav, orig_sr = torchaudio.load(wav_fpath)
+        # Load with scipy (no FFmpeg dependency)
+        orig_sr, wav_np = scipy_wav.read(wav_fpath)
 
-        # Convert to mono
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        wav = wav.squeeze(0).to(self.device)
+        # Convert to float32 [-1, 1]
+        if wav_np.dtype == np.int16:
+            wav_np = wav_np.astype(np.float32) / 32768.0
+        elif wav_np.dtype == np.int32:
+            wav_np = wav_np.astype(np.float32) / 2147483648.0
+        elif wav_np.dtype != np.float32:
+            wav_np = wav_np.astype(np.float32)
+
+        # Convert to mono if stereo
+        if wav_np.ndim > 1:
+            wav_np = wav_np.mean(axis=1)
+
+        wav = torch.from_numpy(wav_np).to(self.device)
 
         # Resample to 24kHz
         if orig_sr != S3GEN_SR:
