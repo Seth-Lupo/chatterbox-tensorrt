@@ -211,6 +211,8 @@ class ChatterboxTurboTTS:
                 - "default": torch.compile with default settings
                 - "reduce-overhead": Optimized for small batches (good for streaming)
                 - "max-autotune": Maximum optimization (slower compile, faster run)
+                - "static-tensorrt": TensorRT with static cache (fastest, requires static cache)
+                - "static-cudagraphs": CUDA graphs with static cache (very fast)
                 - "tensorrt": Use TensorRT backend (requires torch-tensorrt)
         """
         if self._compiled:
@@ -218,6 +220,77 @@ class ChatterboxTurboTTS:
             return
 
         logger.info(f"Compiling models with mode: {mode}")
+
+        # Static cache modes - leverage fixed shapes for maximum optimization
+        if mode == "static-cudagraphs":
+            # CUDA graphs with static shapes - very fast decoding
+            logger.info("Compiling with CUDA graphs (static cache mode)")
+            # Compile T3 with fullgraph for CUDA graph capture
+            self.t3.tfmr = torch.compile(
+                self.t3.tfmr,
+                mode="reduce-overhead",  # Enables CUDA graphs
+                fullgraph=True,  # Full graph capture for static shapes
+            )
+            self.t3.speech_emb = torch.compile(self.t3.speech_emb, fullgraph=True)
+            self.t3.speech_head = torch.compile(self.t3.speech_head, fullgraph=True)
+            # S3Gen flow also benefits from static compilation
+            self.s3gen.flow = torch.compile(
+                self.s3gen.flow,
+                mode="reduce-overhead",
+                fullgraph=True,
+            )
+            logger.info("T3 and S3Gen compiled with CUDA graphs (fullgraph=True)")
+            self._compiled = True
+            return
+
+        if mode == "static-tensorrt":
+            try:
+                import torch_tensorrt
+                logger.info("Compiling with TensorRT (static cache mode)")
+
+                # T3 transformer - static shapes with KV cache
+                # Decode step: 1 token input, fixed cache size
+                self.t3.tfmr = torch_tensorrt.compile(
+                    self.t3.tfmr,
+                    ir="dynamo",
+                    inputs=[
+                        torch_tensorrt.Input(
+                            shape=[1, 1, 1024],  # Single token embedding
+                            dtype=self.dtype,
+                        )
+                    ],
+                    enabled_precisions={self.dtype},
+                    truncate_long_and_double=True,
+                    min_block_size=1,
+                )
+                logger.info("T3 transformer compiled with TensorRT")
+
+                # S3Gen flow - variable length but bounded
+                self.s3gen.flow = torch_tensorrt.compile(
+                    self.s3gen.flow,
+                    inputs=[torch_tensorrt.Input(
+                        min_shape=[1, 80, 10],
+                        opt_shape=[1, 80, 200],
+                        max_shape=[1, 80, 1000],
+                        dtype=self.dtype,
+                    )],
+                    enabled_precisions={self.dtype},
+                    truncate_long_and_double=True,
+                )
+                logger.info("S3Gen flow compiled with TensorRT")
+
+                self.t3.speech_emb = torch.compile(self.t3.speech_emb, fullgraph=True)
+                self.t3.speech_head = torch.compile(self.t3.speech_head, fullgraph=True)
+                self._compiled = True
+                return
+            except ImportError:
+                logger.warning("torch-tensorrt not installed, falling back to static-cudagraphs")
+                mode = "static-cudagraphs"
+                return self.compile_models(mode)
+            except Exception as e:
+                logger.warning(f"TensorRT compilation failed: {e}, falling back to static-cudagraphs")
+                mode = "static-cudagraphs"
+                return self.compile_models(mode)
 
         if mode == "tensorrt":
             try:
@@ -248,7 +321,7 @@ class ChatterboxTurboTTS:
                 logger.warning(f"TensorRT compilation failed: {e}, falling back to torch.compile")
                 mode = "default"
 
-        if mode != "tensorrt":
+        if mode not in ["tensorrt", "static-tensorrt", "static-cudagraphs"]:
             # NOTE: "reduce-overhead" uses CUDA graphs which don't work with
             # autoregressive generation (dynamic shapes, tensor reuse issues).
             # Use "default" mode for streaming/autoregressive workloads.
@@ -297,7 +370,7 @@ class ChatterboxTurboTTS:
         ckpt_dir,
         device,
         dtype: str = "float32",
-        compile_mode: Optional[str] = "default",
+        compile_mode: Optional[str] = "static-cudagraphs",
     ) -> 'ChatterboxTurboTTS':
         """
         Load model from local checkpoint.
@@ -306,7 +379,12 @@ class ChatterboxTurboTTS:
             ckpt_dir: Path to checkpoint directory
             device: Device to load model on ("cuda", "cpu", "mps")
             dtype: Data type ("float32", "float16", "bfloat16")
-            compile_mode: Compilation mode ("default" by default, None to disable, "reduce-overhead", "max-autotune", "tensorrt")
+            compile_mode: Compilation mode:
+                - "static-cudagraphs": CUDA graphs with static cache (default, fastest)
+                - "static-tensorrt": TensorRT with static cache (requires torch-tensorrt)
+                - "default": Basic torch.compile
+                - "max-autotune": Slower compile, faster runtime
+                - None: No compilation
         """
         ckpt_dir = Path(ckpt_dir)
 
@@ -381,7 +459,7 @@ class ChatterboxTurboTTS:
         cls,
         device: str,
         dtype: str = "float32",
-        compile_mode: Optional[str] = "default",
+        compile_mode: Optional[str] = "static-cudagraphs",
     ) -> 'ChatterboxTurboTTS':
         """
         Load model from HuggingFace Hub.
@@ -393,11 +471,11 @@ class ChatterboxTurboTTS:
                 - "float16": Half precision (faster, slight quality loss)
                 - "bfloat16": Brain float16 (faster, better precision than fp16)
             compile_mode: Compilation for faster inference
-                - "default": Basic torch.compile (default, recommended)
-                - None: No compilation (disable)
-                - "reduce-overhead": Good for streaming (small batches)
+                - "static-cudagraphs": CUDA graphs with static cache (default, fastest)
+                - "static-tensorrt": TensorRT with static cache (requires torch-tensorrt)
+                - "default": Basic torch.compile
                 - "max-autotune": Slowest compile, fastest runtime
-                - "tensorrt": Use TensorRT (requires torch-tensorrt)
+                - None: No compilation
 
         Example:
             # Fast inference on GPU with compilation
