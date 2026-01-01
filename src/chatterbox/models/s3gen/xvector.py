@@ -9,7 +9,8 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
-import torchaudio.compliance.kaldi as Kaldi
+import librosa
+import numpy as np
 
 
 def pad_list(xs, pad_value):
@@ -42,19 +43,38 @@ def pad_list(xs, pad_value):
     return pad
 
 
+def compute_fbank(waveform: torch.Tensor, sample_rate: int = 16000, num_mel_bins: int = 80) -> torch.Tensor:
+    """Compute filterbank features using librosa (replaces Kaldi.fbank)."""
+    device = waveform.device
+    audio_np = waveform.squeeze().cpu().numpy()
+    # Kaldi-compatible parameters
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio_np,
+        sr=sample_rate,
+        n_fft=512,
+        hop_length=160,  # 10ms at 16kHz
+        win_length=400,  # 25ms at 16kHz
+        n_mels=num_mel_bins,
+        fmin=20,
+        fmax=sample_rate // 2,
+    )
+    # Log mel (add small epsilon for numerical stability)
+    log_mel = np.log(mel_spec + 1e-6).T  # (time, n_mels)
+    return torch.from_numpy(log_mel).float().to(device)
+
+
 def extract_feature(audio):
     features = []
     feature_times = []
     feature_lengths = []
     for au in audio:
-        feature = Kaldi.fbank(au.unsqueeze(0), num_mel_bins=80)
+        feature = compute_fbank(au.unsqueeze(0), num_mel_bins=80)
         feature = feature - feature.mean(dim=0, keepdim=True)
         features.append(feature)
         feature_times.append(au.shape[0])
         feature_lengths.append(feature.shape[0])
     # padding for batch inference
     features_padded = pad_list(features, pad_value=0)
-    # features = torch.cat(features)
     return features_padded, feature_lengths, feature_times
 
 

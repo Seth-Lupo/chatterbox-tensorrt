@@ -1,7 +1,5 @@
 torch
 torch-tensorrt
-torchaudio
-torchcodec
 numpy
 transformers
 diffusers
@@ -15,3 +13,4 @@ einops
 scipy
 tokenizers
 tqdm
+pip

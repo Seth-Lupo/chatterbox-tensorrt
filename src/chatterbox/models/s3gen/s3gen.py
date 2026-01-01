@@ -16,7 +16,7 @@ import logging
 
 import numpy as np
 import torch
-import torchaudio as ta
+import librosa
 from functools import lru_cache
 from typing import Optional
 
@@ -38,10 +38,20 @@ def drop_invalid_tokens(x):
     return x[x < SPEECH_VOCAB_SIZE]
 
 
-# TODO: global resampler cache
-@lru_cache(100)
-def get_resampler(src_sr, dst_sr, device):
-    return ta.transforms.Resample(src_sr, dst_sr).to(device)
+# Resample using librosa (no torchaudio dependency)
+def resample_audio(audio: torch.Tensor, src_sr: int, dst_sr: int) -> torch.Tensor:
+    """Resample audio tensor using librosa."""
+    if src_sr == dst_sr:
+        return audio
+    device = audio.device
+    dtype = audio.dtype
+    audio_np = audio.cpu().numpy()
+    # Handle batch dimension
+    if audio_np.ndim == 2:
+        resampled = np.stack([librosa.resample(a, orig_sr=src_sr, target_sr=dst_sr) for a in audio_np])
+    else:
+        resampled = librosa.resample(audio_np, orig_sr=src_sr, target_sr=dst_sr)
+    return torch.from_numpy(resampled).to(device=device, dtype=dtype)
 
 
 class S3Token2Mel(torch.nn.Module):
@@ -137,7 +147,7 @@ class S3Token2Mel(torch.nn.Module):
 
         ref_wav_24 = ref_wav
         if ref_sr != S3GEN_SR:
-            ref_wav_24 = get_resampler(ref_sr, S3GEN_SR, device)(ref_wav)
+            ref_wav_24 = resample_audio(ref_wav, ref_sr, S3GEN_SR)
         ref_wav_24 = ref_wav_24.to(device=device, dtype=self.dtype)
 
         ref_mels_24 = self.mel_extractor(ref_wav_24).transpose(1, 2).to(dtype=self.dtype)
@@ -146,7 +156,7 @@ class S3Token2Mel(torch.nn.Module):
         # Resample to 16kHz
         ref_wav_16 = ref_wav
         if ref_sr != S3_SR:
-            ref_wav_16 = get_resampler(ref_sr, S3_SR, device)(ref_wav)
+            ref_wav_16 = resample_audio(ref_wav, ref_sr, S3_SR)
 
         # Speaker embedding
         ref_x_vector = self.speaker_encoder.inference(ref_wav_16.to(dtype=self.dtype))
