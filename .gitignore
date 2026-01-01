@@ -45,4 +45,4 @@ checkpoints/
 .gradio
 
 # Ignore generated sample .wav files
-**/*.wav
+
