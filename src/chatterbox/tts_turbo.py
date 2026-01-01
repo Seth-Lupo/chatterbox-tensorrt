@@ -197,86 +197,42 @@ class ChatterboxTurboTTS:
             py_logging.getLogger("torch._inductor").setLevel(py_logging.ERROR)
             warnings.filterwarnings("ignore")
 
-            # Dynamic shape profiles: min, opt, max sequence lengths
-            min_seq, opt_seq, max_seq = 10, 200, 1000
+            # Use torch.compile with tensorrt backend
+            # Mark sequence dim as dynamic using torch.export conventions
+            seq_dim = torch.export.Dim("seq", min=10, max=1000)
 
-            # Define dynamic inputs with shape profiles
-            dynamic_inputs = [
-                # x: (1, 80, seq)
-                torch_tensorrt.Input(
-                    min_shape=(1, 80, min_seq),
-                    opt_shape=(1, 80, opt_seq),
-                    max_shape=(1, 80, max_seq),
-                    dtype=self.dtype,
-                ),
-                # mask: (1, 1, seq)
-                torch_tensorrt.Input(
-                    min_shape=(1, 1, min_seq),
-                    opt_shape=(1, 1, opt_seq),
-                    max_shape=(1, 1, max_seq),
-                    dtype=self.dtype,
-                ),
-                # mu: (1, 80, seq)
-                torch_tensorrt.Input(
-                    min_shape=(1, 80, min_seq),
-                    opt_shape=(1, 80, opt_seq),
-                    max_shape=(1, 80, max_seq),
-                    dtype=self.dtype,
-                ),
-                # t: (1,)
-                torch_tensorrt.Input(
-                    min_shape=(1,),
-                    opt_shape=(1,),
-                    max_shape=(1,),
-                    dtype=self.dtype,
-                ),
-                # spks: (1, 80)
-                torch_tensorrt.Input(
-                    min_shape=(1, 80),
-                    opt_shape=(1, 80),
-                    max_shape=(1, 80),
-                    dtype=self.dtype,
-                ),
-                # cond: (1, 80, seq)
-                torch_tensorrt.Input(
-                    min_shape=(1, 80, min_seq),
-                    opt_shape=(1, 80, opt_seq),
-                    max_shape=(1, 80, max_seq),
-                    dtype=self.dtype,
-                ),
-                # r: (1,)
-                torch_tensorrt.Input(
-                    min_shape=(1,),
-                    opt_shape=(1,),
-                    max_shape=(1,),
-                    dtype=self.dtype,
-                ),
-            ]
-
-            # Compile with TensorRT using dynamic shapes
-            self.s3gen.flow.decoder.estimator = torch_tensorrt.compile(
+            self.s3gen.flow.decoder.estimator = torch.compile(
                 self.s3gen.flow.decoder.estimator,
-                ir="dynamo",
-                inputs=dynamic_inputs,
-                enabled_precisions={torch.float16, torch.float32},
-                truncate_double=True,
-                min_block_size=1,
-                debug=False,
+                backend="torch_tensorrt",
+                dynamic=True,
+                options={
+                    "enabled_precisions": {torch.float16, torch.float32},
+                    "truncate_long_and_double": True,
+                    "min_block_size": 1,
+                    "debug": False,
+                    "dim_range": {
+                        "x": {2: (10, 200, 1000)},      # seq dim: min, opt, max
+                        "mask": {2: (10, 200, 1000)},
+                        "mu": {2: (10, 200, 1000)},
+                        "cond": {2: (10, 200, 1000)},
+                    },
+                }
             )
 
-            # Warmup with opt shape
+            # Warmup with typical shapes to build engine
             with torch.inference_mode():
-                dummy_x = torch.randn(1, 80, opt_seq, device=self.device, dtype=self.dtype)
-                dummy_mask = torch.ones(1, 1, opt_seq, device=self.device, dtype=self.dtype)
-                dummy_mu = torch.randn(1, 80, opt_seq, device=self.device, dtype=self.dtype)
-                dummy_t = torch.tensor([0.5], device=self.device, dtype=self.dtype)
-                dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
-                dummy_cond = torch.randn(1, 80, opt_seq, device=self.device, dtype=self.dtype)
-                dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
-                _ = self.s3gen.flow.decoder.estimator(
-                    dummy_x, mask=dummy_mask, mu=dummy_mu, t=dummy_t,
-                    spks=dummy_spks, cond=dummy_cond, r=dummy_r
-                )
+                for seq_len in [50, 200, 500]:
+                    dummy_x = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
+                    dummy_mask = torch.ones(1, 1, seq_len, device=self.device, dtype=self.dtype)
+                    dummy_mu = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
+                    dummy_t = torch.tensor([0.5], device=self.device, dtype=self.dtype)
+                    dummy_spks = torch.randn(1, 80, device=self.device, dtype=self.dtype)
+                    dummy_cond = torch.randn(1, 80, seq_len, device=self.device, dtype=self.dtype)
+                    dummy_r = torch.tensor([0.6], device=self.device, dtype=self.dtype)
+                    _ = self.s3gen.flow.decoder.estimator(
+                        dummy_x, mask=dummy_mask, mu=dummy_mu, t=dummy_t,
+                        spks=dummy_spks, cond=dummy_cond, r=dummy_r
+                    )
                 torch.cuda.synchronize()
         else:
             compile_kwargs = {"dynamic": True}
