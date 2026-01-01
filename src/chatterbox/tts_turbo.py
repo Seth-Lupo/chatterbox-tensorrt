@@ -6,10 +6,10 @@ from pathlib import Path
 import time
 from typing import Generator, Tuple, Optional
 
-import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchaudio
 
 from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
@@ -167,6 +167,16 @@ class ChatterboxTurboTTS:
 
         # Pre-create logits processors (avoid recreating each call)
         self._logits_processors_cache = {}
+
+        # Cached resamplers for GPU-accelerated audio processing
+        self._resamplers = {}
+
+    def _get_resampler(self, src_sr: int, dst_sr: int) -> torchaudio.transforms.Resample:
+        """Get or create a cached resampler for the given sample rates."""
+        key = (src_sr, dst_sr)
+        if key not in self._resamplers:
+            self._resamplers[key] = torchaudio.transforms.Resample(src_sr, dst_sr).to(self.device)
+        return self._resamplers[key]
 
     def compile_models(self, mode: str = "default"):
         """
@@ -391,12 +401,29 @@ class ChatterboxTurboTTS:
         return cls.from_local(local_path, device, dtype=dtype, compile_mode=compile_mode)
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+        ## Load reference wav using torchaudio (faster than librosa)
+        wav, orig_sr = torchaudio.load(wav_fpath)
 
-        assert len(s3gen_ref_wav) / _sr > 5.0, "Audio prompt must be longer than 5 seconds!"
+        # Convert to mono if stereo
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        wav = wav.squeeze(0)  # Remove channel dim -> (samples,)
 
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        # Move to GPU for accelerated resampling
+        wav = wav.to(self.device)
+
+        # Resample to S3GEN_SR (24kHz) on GPU
+        if orig_sr != S3GEN_SR:
+            resampler_to_24k = self._get_resampler(orig_sr, S3GEN_SR)
+            s3gen_ref_wav = resampler_to_24k(wav)
+        else:
+            s3gen_ref_wav = wav
+
+        assert len(s3gen_ref_wav) / S3GEN_SR > 5.0, "Audio prompt must be longer than 5 seconds!"
+
+        # Resample to S3_SR (16kHz) on GPU
+        resampler_to_16k = self._get_resampler(S3GEN_SR, S3_SR)
+        ref_16k_wav = resampler_to_16k(s3gen_ref_wav)
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
@@ -407,8 +434,9 @@ class ChatterboxTurboTTS:
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
 
-        # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+        # Voice-encoder speaker embedding (requires numpy array)
+        ref_16k_wav_np = ref_16k_wav.cpu().numpy()
+        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav_np], sample_rate=S3_SR))
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
         t3_cond = T3Cond(
