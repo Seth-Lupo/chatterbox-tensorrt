@@ -624,11 +624,11 @@ class ChatterboxTurboTTS:
         # Starts small for fast TTFA, gradually increases for better quality
         # Early chunks: no/minimal fade to avoid tremolo on short audio
         ramp_schedule = [
-            (8, 0, 0.0, 0.0),        # Chunk 0: no fade (start of audio)
-            (12, 8, 0.01, 0.0),      # Chunk 1: tiny fade-in only
-            (18, 20, 0.02, 0.01),    # Chunk 2: gentle crossfade
-            (chunk_size, 40, 0.03, 0.02),   # Chunk 3: building up
-            (chunk_size, 60, 0.04, 0.03),   # Chunk 4
+            (10, 0, 0.0, 0.0),       # Chunk 0: small but complete phrase, no fade
+            (15, 10, 0.01, 0.0),     # Chunk 1: growing, tiny fade-in only
+            (20, 25, 0.02, 0.01),    # Chunk 2: gentle crossfade
+            (chunk_size, 45, 0.03, 0.02),   # Chunk 3: building up
+            (chunk_size, 70, 0.04, 0.03),   # Chunk 4
             (chunk_size, 100, 0.05, 0.04),  # Chunk 5
             (chunk_size, 150, fade_duration, fade_duration),  # Chunk 6
             (chunk_size, context_window, fade_duration, fade_duration),  # Chunk 7+: full (200)
