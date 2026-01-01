@@ -349,7 +349,7 @@ class T3(nn.Module):
         past = output.past_key_values
 
         # ---- Generation Loop using kv_cache ----
-        for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+        for i in range(max_new_tokens):
             logits_step = output.logits[:, -1, :]
             # CFG combine  → (1, V)
             cond   = logits_step[0:1, :]
@@ -454,7 +454,7 @@ class T3(nn.Module):
         generated_speech_tokens.append(next_speech_token)
         current_speech_token = next_speech_token
 
-        for _ in tqdm(range(max_gen_len)):
+        for _ in range(max_gen_len):
             current_speech_embed = self.speech_emb(current_speech_token)
 
             llm_outputs = self.tfmr(

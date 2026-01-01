@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description="Chatterbox Turbo Streaming TTS")
     parser.add_argument("--text", type=str,
         default="Through silicon dreams and whispered code, I walk the paths that few have strode. A voice emerged from ones and zeros, speaking truths like digital heroes.")
-    parser.add_argument("--audio_prompt", type=str, default="male_voice.wav",
+    parser.add_argument("--audio_prompt", type=str, default="voice_ref.wav",
         help="Path to reference audio for voice cloning (must be >5 seconds)")
     parser.add_argument("--output", type=str, default="output.wav",
         help="Output audio file path")
@@ -49,6 +49,8 @@ def main():
     for chunk, metrics in model.generate_stream(
         text=args.text,
         audio_prompt_path=args.audio_prompt,
+        temperature=0.3,
+        exaggeration=0.5,
     ):
         audio_chunks.append(chunk)
         if metrics.latency_to_first_chunk and metrics.chunk_count == 1:
