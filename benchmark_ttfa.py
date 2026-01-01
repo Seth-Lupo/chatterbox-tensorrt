@@ -11,7 +11,7 @@ import logging
 import os
 warnings.filterwarnings("ignore")
 os.environ["TORCHDYNAMO_VERBOSE"] = "0"
-os.environ["TORCH_LOGS"] = ""
+os.environ["TORCH_LOGS"] = "-all"
 logging.getLogger("torch").setLevel(logging.ERROR)
 logging.getLogger("torch_tensorrt").setLevel(logging.ERROR)
 
@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 from chatterbox import ChatterboxTurboTTS
