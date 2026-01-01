@@ -502,7 +502,7 @@ class ChatterboxTurboTTS:
         start_time: float,
         metrics: StreamingMetrics,
         prev_tail: Optional[np.ndarray],
-        crossfade_ms: float = 12.0,
+        crossfade_ms: float = 20.0,
         cfm_steps: int = 5,
     ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
         """Process a chunk of tokens and return audio with optional crossfade."""
@@ -558,31 +558,46 @@ class ChatterboxTurboTTS:
             return None, 0.0, False, prev_tail
 
         # Crossfade to eliminate crackles at chunk boundaries
+        # Use longer crossfade for smoother transitions
         crossfade_samples = int(crossfade_ms * self.sr / 1000)
+
+        # Remove DC offset (prevents low-frequency clicks)
+        audio_chunk = audio_chunk - np.mean(audio_chunk)
 
         if prev_tail is not None and crossfade_samples > 0:
             blend_len = min(crossfade_samples, len(prev_tail), len(audio_chunk))
             if blend_len > 0:
                 # Check if we're in a low-energy (silence) region - need more blending
-                tail_energy = np.mean(np.abs(prev_tail[-blend_len:]))
+                tail_energy = np.mean(np.abs(prev_tail))
                 head_energy = np.mean(np.abs(audio_chunk[:blend_len]))
-                is_low_energy = (tail_energy < 0.01) or (head_energy < 0.01)
+                is_low_energy = (tail_energy < 0.02) or (head_energy < 0.02)
 
                 # Use longer blend for silence regions (where clicks are most audible)
                 if is_low_energy:
-                    blend_len = min(blend_len * 3, len(prev_tail), len(audio_chunk))
+                    blend_len = min(blend_len * 4, len(prev_tail), len(audio_chunk))
 
                 # Equal-power crossfade (better than linear for audio)
                 t = np.linspace(0, np.pi / 2, blend_len, dtype=audio_chunk.dtype)
                 fade_out = np.cos(t)  # 1 -> 0
                 fade_in = np.sin(t)   # 0 -> 1
 
-                # Blend the overlap region
-                blended = prev_tail[-blend_len:] * fade_out + audio_chunk[:blend_len] * fade_in
+                # Blend the overlap region: prev_tail was held back, now blend with new chunk start
+                blended = prev_tail[:blend_len] * fade_out + audio_chunk[:blend_len] * fade_in
                 audio_chunk = np.concatenate([blended, audio_chunk[blend_len:]])
+        else:
+            # First chunk: apply fade-in to avoid click at start
+            fade_in_samples = min(crossfade_samples, len(audio_chunk))
+            if fade_in_samples > 0:
+                fade_in = np.linspace(0, 1, fade_in_samples, dtype=audio_chunk.dtype)
+                audio_chunk[:fade_in_samples] *= fade_in
 
-        # Save tail for next chunk
-        new_tail = audio_chunk[-crossfade_samples:].copy() if len(audio_chunk) >= crossfade_samples else audio_chunk.copy()
+        # Hold back tail samples for blending with next chunk (don't output them yet)
+        if len(audio_chunk) > crossfade_samples:
+            new_tail = audio_chunk[-crossfade_samples:].copy()
+            audio_chunk = audio_chunk[:-crossfade_samples]  # Trim tail from output
+        else:
+            new_tail = audio_chunk.copy()
+            audio_chunk = np.array([], dtype=audio_chunk.dtype)
 
         # Compute audio duration
         audio_duration = len(audio_chunk) / self.sr
@@ -617,7 +632,7 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
         context_window: int = 500,
-        crossfade_ms: float = 12.0,
+        crossfade_ms: float = 20.0,
         cfm_steps: int = 5,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
@@ -713,7 +728,7 @@ class ChatterboxTurboTTS:
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
                 _, current_context, current_cfm = ramp_schedule[schedule_idx]
 
-                audio_tensor, audio_duration, success, _ = self._process_token_chunk(
+                audio_tensor, audio_duration, success, prev_tail = self._process_token_chunk(
                     new_tokens, all_tokens, current_context, start_time, metrics,
                     prev_tail, crossfade_ms, current_cfm
                 )
@@ -721,6 +736,16 @@ class ChatterboxTurboTTS:
                 if success:
                     total_audio_duration += audio_duration
                     yield audio_tensor, metrics
+
+            # Flush the held-back tail with fade-out applied
+            if prev_tail is not None and len(prev_tail) > 0:
+                # Apply fade-out to prevent click at end
+                fade_out = np.linspace(1, 0, len(prev_tail), dtype=prev_tail.dtype)
+                final_tail = prev_tail * fade_out
+                final_audio = torch.from_numpy(final_tail.copy()).unsqueeze(0)
+                total_audio_duration += len(final_tail) / self.sr
+                metrics.chunk_count += 1
+                yield final_audio, metrics
 
         # Final metrics
         metrics.total_generation_time = time.time() - start_time
