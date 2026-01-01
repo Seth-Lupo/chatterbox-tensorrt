@@ -497,8 +497,10 @@ class ChatterboxTurboTTS:
         context_window: int,
         start_time: float,
         metrics: StreamingMetrics,
-    ) -> Tuple[Optional[torch.Tensor], float, bool]:
-        """Process a chunk of tokens and return audio."""
+        prev_tail: Optional[np.ndarray],
+        crossfade_ms: float = 5.0,
+    ) -> Tuple[Optional[torch.Tensor], float, bool, Optional[np.ndarray]]:
+        """Process a chunk of tokens and return audio with optional crossfade."""
         # Build tokens_to_process by including context window
         if len(all_tokens_so_far) > 0:
             context_tokens = (
@@ -515,7 +517,7 @@ class ChatterboxTurboTTS:
         # Filter invalid tokens
         tokens_to_process = tokens_to_process[tokens_to_process < 6561]
         if len(tokens_to_process) == 0:
-            return None, 0.0, False
+            return None, 0.0, False, prev_tail
 
         tokens_to_process = tokens_to_process.to(self.device)
 
@@ -536,7 +538,24 @@ class ChatterboxTurboTTS:
             audio_chunk = wav
 
         if len(audio_chunk) == 0:
-            return None, 0.0, False
+            return None, 0.0, False, prev_tail
+
+        # Simple crossfade to eliminate crackles at chunk boundaries
+        crossfade_samples = int(crossfade_ms * self.sr / 1000)
+
+        if prev_tail is not None and crossfade_samples > 0:
+            blend_len = min(crossfade_samples, len(prev_tail), len(audio_chunk))
+            if blend_len > 0:
+                # Linear crossfade (simple and effective)
+                fade_out = np.linspace(1.0, 0.0, blend_len, dtype=audio_chunk.dtype)
+                fade_in = np.linspace(0.0, 1.0, blend_len, dtype=audio_chunk.dtype)
+
+                # Blend the overlap region
+                blended = prev_tail[-blend_len:] * fade_out + audio_chunk[:blend_len] * fade_in
+                audio_chunk = np.concatenate([blended, audio_chunk[blend_len:]])
+
+        # Save tail for next chunk
+        new_tail = audio_chunk[-crossfade_samples:].copy() if len(audio_chunk) >= crossfade_samples else audio_chunk.copy()
 
         # Compute audio duration
         audio_duration = len(audio_chunk) / self.sr
@@ -547,7 +566,7 @@ class ChatterboxTurboTTS:
             metrics.latency_to_first_chunk = time.time() - start_time
 
         metrics.chunk_count += 1
-        return audio_tensor, audio_duration, True
+        return audio_tensor, audio_duration, True, new_tail
 
     def generate_stream(
         self,
@@ -560,6 +579,7 @@ class ChatterboxTurboTTS:
         repetition_penalty: float = 1.2,
         chunk_size: int = 25,
         context_window: int = 500,
+        crossfade_ms: float = 5.0,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming TTS generation that yields audio chunks as they are generated.
@@ -576,6 +596,7 @@ class ChatterboxTurboTTS:
             repetition_penalty: Repetition penalty
             chunk_size: Target tokens for chunks after ramp-up (default 25)
             context_window: Max context tokens for audio coherence (default 500)
+            crossfade_ms: Crossfade duration in ms to smooth chunk boundaries (default 5ms)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
@@ -596,6 +617,7 @@ class ChatterboxTurboTTS:
         total_audio_duration = 0.0
         all_tokens = torch.tensor([], dtype=torch.long, device=self.device)
         chunk_buffer = []
+        prev_tail: Optional[np.ndarray] = None
 
         # Dynamic ramp-up schedule: [chunk_size, context_window]
         # Starts small for fast TTFA, gradually increases for better quality
@@ -630,8 +652,9 @@ class ChatterboxTurboTTS:
                 if len(chunk_buffer) >= current_chunk_size:
                     new_tokens = torch.cat(chunk_buffer, dim=-1).squeeze(0)
 
-                    audio_tensor, audio_duration, success = self._process_token_chunk(
-                        new_tokens, all_tokens, current_context, start_time, metrics
+                    audio_tensor, audio_duration, success, prev_tail = self._process_token_chunk(
+                        new_tokens, all_tokens, current_context, start_time, metrics,
+                        prev_tail, crossfade_ms
                     )
 
                     if success:
@@ -649,8 +672,9 @@ class ChatterboxTurboTTS:
                 schedule_idx = min(metrics.chunk_count, len(ramp_schedule) - 1)
                 _, current_context = ramp_schedule[schedule_idx]
 
-                audio_tensor, audio_duration, success = self._process_token_chunk(
-                    new_tokens, all_tokens, current_context, start_time, metrics
+                audio_tensor, audio_duration, success, _ = self._process_token_chunk(
+                    new_tokens, all_tokens, current_context, start_time, metrics,
+                    prev_tail, crossfade_ms
                 )
 
                 if success:
