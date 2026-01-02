@@ -58,14 +58,17 @@ def load_model_hybrid() -> ChatterboxTurboTTS:
     return model
 
 
-def warmup(model: ChatterboxTurboTTS, voice_path: str):
-    """Warmup the model."""
+def warmup(model: ChatterboxTurboTTS, voice_path: str, schedules: list[list[tuple]]):
+    """Warmup the model with all schedule configurations."""
     print("Warming up...")
     model.prepare_conditionals(voice_path, exaggeration=0.5)
 
-    # Run one generation
-    for _ in model.generate_stream("Hello.", ramp_schedule=[(4, 0, 1)]):
-        break
+    # Warmup each schedule configuration to trigger JIT compilation
+    for i, schedule in enumerate(schedules):
+        print(f"  Warmup config {i+1}/{len(schedules)}: {schedule[0]} (first chunk)")
+        for _ in model.generate_stream("Hello.", ramp_schedule=schedule):
+            break
+
     print("Warmup complete")
 
 
