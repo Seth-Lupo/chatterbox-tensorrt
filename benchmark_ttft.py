@@ -195,8 +195,16 @@ def main():
         else:
             model = load_model_hybrid()
 
-    # Warmup
-    warmup(model, args.voice)
+    # Define schedules
+    minimal_schedule = [
+        (2, 0, 1),  # Ultra minimal first chunk
+        (8, 2, 3),
+        (16, 10, 5),
+        (32, 26, 7),
+    ]
+
+    # Warmup BOTH configurations to avoid JIT compilation during benchmark
+    warmup(model, args.voice, schedules=[DEFAULT_RAMP_SCHEDULE, minimal_schedule])
 
     # Run benchmark with default schedule
     print(f"\n--- Benchmark with DEFAULT schedule ---")
@@ -213,12 +221,6 @@ def main():
 
     # Also test with minimal first chunk for comparison
     print(f"\n--- Benchmark with MINIMAL first chunk (2 tokens, 1 CFM) ---")
-    minimal_schedule = [
-        (2, 0, 1),  # Ultra minimal first chunk
-        (8, 2, 3),
-        (16, 10, 5),
-        (32, 26, 7),
-    ]
 
     results_minimal = benchmark_ttft(
         model,
