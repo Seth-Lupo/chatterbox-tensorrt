@@ -1,0 +1,390 @@
+
+╭─── Claude Code v2.0.76 ──────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                 Welcome back Seth!                 │ started                 │
+│                                                    │ Run /init to create a … │
+│                     * ▐▛███▜▌ *                    │ ─────────────────────── │
+│                    * ▝▜█████▛▘ *                   │ Recent activity         │
+│                     *  ▘▘ ▝▝  *                    │ No recent activity      │
+│                                                    │                         │
+│    Opus 4.5 · Claude Max · seth@squibber.com's     │                         │
+│    Organization                                    │                         │
+│              ~/Public/new-bot/martha               │                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+══════════════════ Conversation compacted · ctrl+o for history ═════════════════
+
+> /compact 
+  ⎿  Compacted (ctrl+o to see full summary)
+  ⎿  Read test_trt_inference.py (377 lines)
+  ⎿  Referenced file src/chatterbox/tts_turbo_trt.py
+  ⎿  Read test_tts_turbo_trt.py (208 lines)
+  ⎿  Read ../../../../../tmp/t3_trt_export/requirements.txt (6 lines)
+  ⎿  Read src/chatterbox/models/t3/trt/README.md (330 lines)
+
+> is this usign the trt backbone (NOT FALLING BACK) (venv) 
+root@6a9a4497970c:/workspace# python3 test_trt_inference.py --text "I love 
+pie. I love cookies. I want to say words because I am a robot."
+/workspace/venv/lib/python3.12/site-packages/torch/cuda/__init__.py:63: 
+FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py
+ instead. If you did not install pynvml directly, please report this to the 
+maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+2026-01-06 12:40:54,358 - INFO - 
+============================================================
+2026-01-06 12:40:54,358 - INFO - T3 TensorRT-LLM Full Pipeline Test
+2026-01-06 12:40:54,359 - INFO - 
+============================================================
+2026-01-06 12:40:56,443 - INFO - NumExpr defaulting to 4 threads.
+2026-01-06 12:40:56,625 - INFO - Loading tokenizer...
+Fetching 5 files: 
+100%|██████████████████████████████████████████████████████████████| 5/5 
+[00:00<00:00, 95760.37it/s]
+2026-01-06 12:40:57,033 - INFO - Text: 'I love pie. I love cookies. I want 
+to say words because I am a robot.'
+2026-01-06 12:40:57,033 - INFO - Text tokens: torch.Size([1, 19])
+2026-01-06 12:40:57,033 - INFO - Attempting TRT-LLM ModelRunner inference...
+2026-01-06 12:41:00,684 - INFO - PyTorch version 2.9.0 available.
+[TensorRT-LLM] TensorRT LLM version: 1.1.0
+2026-01-06 12:41:02,611 - INFO - Loading TRT-LLM engine from ./t3_engine
+2026-01-06 12:41:03,820 - INFO - Loading custom components...
+2026-01-06 12:41:03,821 - INFO - Voice prefix: torch.Size([251, 1024])
+2026-01-06 12:41:03,825 - INFO - Speech embedding: torch.Size([6563, 1024])
+2026-01-06 12:41:03,835 - INFO - Speech head: weight=torch.Size([6563, 
+1024]), bias=torch.Size([6563])
+2026-01-06 12:41:03,835 - INFO - T3 TRT Inference ready
+2026-01-06 12:41:03,835 - INFO - Generating speech from 19 text tokens...
+/workspace/venv/lib/python3.12/site-packages/torch/nested/__init__.py:250: 
+UserWarning: The PyTorch API of nested tensors is in prototype stage and 
+will change in the near future. We recommend specifying layout=torch.jagged 
+when constructing a nested tensor, as this layout receives active 
+development, has better operator coverage, and works with torch.compile. 
+(Triggered internally at /pytorch/aten/src/ATen/NestedTensorImpl.cpp:178.)
+  return _nested.nested_tensor(
+2026-01-06 12:41:06,186 - ERROR - TRT-LLM inference failed: '<=' not 
+supported between instances of 'int' and 'list'
+2026-01-06 12:41:06,186 - INFO - Falling back to PyTorch model for vocoder 
+test...
+Fetching 10 files: 
+100%|██████████████████████████████████████████████████████████| 10/10 
+[00:00<00:00, 132312.43it/s]
+/workspace/venv/lib/python3.12/site-packages/torch/__init__.py:1617: 
+UserWarning: Please use the new API settings to control TF32 behavior, such 
+as torch.backends.cudnn.conv.fp32_precision = 'tf32' or 
+torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, 
+torch.backends.cuda.matmul.allow_tf32 = True, 
+torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and 
+allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see 
+https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-
+and-later-devices (Triggered internally at 
+/pytorch/aten/src/ATen/Context.cpp:80.)
+  _C._set_float32_matmul_precision(precision)
+2026-01-06 12:41:11,563 - INFO - Loaded T3 weights: 297 keys
+2026-01-06 12:41:15,796 - INFO - input frame rate=25
+2026-01-06 12:41:16,494 - INFO - Baking voice from: voice_ref.wav
+2026-01-06 12:41:18,106 - INFO - Baked voice conditioning: 
+shape=torch.Size([1, 251, 1024])
+2026-01-06 12:41:18,106 - INFO - Voice baked! Prefix length: 251 tokens
+2026-01-06 12:41:20,179 - INFO - Generated audio in 2.00s
+2026-01-06 12:41:20,179 - INFO - Audio shape: torch.Size([1, 127680])
+2026-01-06 12:41:20,180 - INFO - Saved audio to output_trt.wav 
+
+⏺ No, it's NOT using TRT - it's falling back to PyTorch. Look at this line:
+
+  2026-01-06 12:41:06,186 - ERROR - TRT-LLM inference failed: '<=' not supported between instances of 'int' and 'list'
+  2026-01-06 12:41:06,186 - INFO - Falling back to PyTorch model for vocoder test...
+
+  The TRT-LLM inference failed with a comparison error. This is likely an API mismatch with how we're calling ModelRunner.generate(). Let me fix the inference test:
+
+⏺ Read(test_trt_inference.py)
+  ⎿  Read 60 lines
+
+⏺ The issue is the TRT-LLM ModelRunner API. Newer versions expect batch_input_ids as a list of tensors, not a batched tensor. Let me fix this:
+
+⏺ Update(test_trt_inference.py)
+  ⎿  Added 28 lines, removed 16 lines                                    
+      117          if text_token_ids.dim() == 1:                         
+      118              text_token_ids = text_token_ids.unsqueeze(0)      
+      119                                                                
+      120 -        input_ids = text_token_ids.int().cuda()               
+      121 -        input_lengths =                                       
+          -torch.tensor([text_token_ids.shape[1]], dtype=torch.int32,    
+          -device="cuda")                                                
+      120 +        # TRT-LLM expects batch_input_ids as a LIST of 1D     
+          +tensors (one per batch element)                               
+      121 +        batch_input_ids = [text_token_ids[0].int().cuda()]    
+      122                                                                
+      123 -        # TRT-LLM generate                                    
+      123 +        # TRT-LLM generate with correct API                   
+      124          output = self.runner.generate(                        
+      125 -            input_ids,                                        
+      126 -            input_lengths=input_lengths,                      
+      125 +            batch_input_ids=batch_input_ids,                  
+      126              max_new_tokens=max_new_tokens,                    
+      127              temperature=temperature,                          
+      128              top_k=top_k,                                      
+     ...
+      132              pad_id=0,                                         
+      133          )                                                     
+      134                                                                
+      135 -        # Extract output                                      
+      135 +        # Extract output - handle various return formats      
+      136 +        logger.info(f"Output type: {type(output)}")           
+      137 +                                                              
+      138          if hasattr(output, 'output_ids'):                     
+      139 -            generated = output.output_ids[0].cpu().tolist()   
+      139 +            # GenerationOutput object                         
+      140 +            output_ids = output.output_ids                    
+      141 +            logger.info(f"output_ids type:                    
+          +{type(output_ids)}, len: {len(output_ids) if                  
+          +hasattr(output_ids, '__len__') else 'N/A'}")                  
+      142 +            if isinstance(output_ids, list):                  
+      143 +                generated = output_ids[0]                     
+      144 +            else:                                             
+      145 +                generated = output_ids[0]                     
+      146 +            if hasattr(generated, 'cpu'):                     
+      147 +                generated = generated.cpu().tolist()          
+      148 +            elif hasattr(generated, 'tolist'):                
+      149 +                generated = generated.tolist()                
+      150          elif isinstance(output, dict) and 'output_ids' in     
+           output:                                                       
+      151              generated = output['output_ids'][0]               
+      152              if hasattr(generated, 'cpu'):                     
+      153                  generated = generated.cpu().tolist()          
+      154          elif isinstance(output, torch.Tensor):                
+      155              generated = output[0].cpu().tolist()              
+      156 +        elif isinstance(output, list):                        
+      157 +            generated = output[0]                             
+      158 +            if hasattr(generated, 'cpu'):                     
+      159 +                generated = generated.cpu().tolist()          
+      160 +            elif hasattr(generated, 'tolist'):                
+      161 +                generated = generated.tolist()                
+      162          else:                                                 
+      163 -            # Try direct indexing                             
+      164 -            try:                                              
+      165 -                generated = output[0]                         
+      166 -                if hasattr(generated, 'cpu'):                 
+      167 -                    generated = generated.cpu().tolist()      
+      168 -                elif hasattr(generated, 'tolist'):            
+      169 -                    generated = generated.tolist()            
+      170 -            except:                                           
+      171 -                generated = list(output)                      
+      163 +            logger.warning(f"Unknown output format:           
+          +{type(output)}")                                              
+      164 +            generated = list(output)                          
+      165                                                                
+      166 +        logger.info(f"Raw generated tokens (first 20):        
+          +{generated[:20] if len(generated) > 20 else generated}")      
+      167 +                                                              
+      168          # Filter to valid speech tokens                       
+      169          speech_tokens = [t for t in generated if 0 <= t <     
+           self.speech_vocab_size]                                       
+      170                                                                
+
+⏺ Now let me upload the fixed file:
+
+⏺ Bash(scp -i /Users/sethlupo/Public/new-bot/martha/pair.pem
+      /Users/sethlupo/Public/new-bot/martha/test_trt_inference.py
+      root@54.88.16.201:/workspace/test_trt_inferenc…)
+  ⎿  Running in the background (↓ to manage)
+
+⏺ Task Output b751525
+  ⎿ [stderr] ssh: connect to host 54.88.16.201 port 22: Operation timed out
+    [stderr] scp: Connection closed
+
+
+⏺ Connection timed out to that IP. Looking at your terminal output, you're running in a local Docker container (root@6a9a4497970c:/workspace#), not a remote EC2.
+
+  The key fix is changing how we call runner.generate(). TRT-LLM expects batch_input_ids as a list of 1D tensors, not a batched 2D tensor.
+
+  Here's the fix to apply in your Docker container - change lines 120-133 in test_trt_inference.py:
+
+  Old:
+  input_ids = text_token_ids.int().cuda()
+  input_lengths = torch.tensor([text_token_ids.shape[1]], dtype=torch.int32, device="cuda")
+
+  # TRT-LLM generate
+  output = self.runner.generate(
+      input_ids,
+      input_lengths=input_lengths,
+      max_new_tokens=max_new_tokens,
+      ...
+  )
+
+  New:
+  # TRT-LLM expects batch_input_ids as a LIST of 1D tensors (one per batch element)
+  batch_input_ids = [text_token_ids[0].int().cuda()]
+
+  # TRT-LLM generate with correct API
+  output = self.runner.generate(
+      batch_input_ids=batch_input_ids,
+      max_new_tokens=max_new_tokens,
+      ...
+  )
+
+  Do you want me to:
+  1. Give you the full updated file content to copy-paste?
+  2. Tell you how to mount/copy from your host machine into the Docker container?
+
+> 2026-01-06 12:46:20,837 - INFO - Output type: <class 'torch.Tensor'>
+2026-01-06 12:46:20,837 - INFO - Raw generated tokens (first 20): [[40, 
+1842, 2508, 13, 314, 1842, 14746, 13, 314, 765, 284, 910, 2456, 780, 314, 
+716, 257, 9379, 13, 760, 1724, 2346, 11, 11, 1438, 338, 15334, 10973, 338, 
+10033, 1936, 370, 2332, 530, 2097, 37516, 290, 262, 1021, 1936, 9760, 50256,
+  ... 26-01-06 12:46:20,837 - ERROR - TRT-LLM inference failed: '<=' not 
+supported between instances of 'int' and 'list'
+2026-01-06 12:46:20,837 - INFO - Falling back to PyTorch model for vocoder 
+test...
+Fetching 10 files: 
+100%|███████████████████████████████████████████████████████████| 10/10 
+[00:00<00:00, 47339.77it/s]
+/workspace/venv/lib/python3.12/site-packages/torch/__init__.py:1617: 
+UserWarning: Please use the new API settings to control TF32 behavior, such 
+as torch.backends.cudnn.conv.fp32_precision = 'tf32' or 
+torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, 
+torch.backends.cuda.matmul.allow_tf32 = True, 
+torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and 
+allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see 
+https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-
+and-later-devices (Triggered internally at 
+/pytorch/aten/src/ATen/Context.cpp:80.) 
+
+⏺ Good progress! TRT-LLM is now returning output, but two issues:
+
+  1. Parsing bug: Output is nested [[40, 1842, ...]] - the iteration fails because t is a list, not an int
+  2. Bigger problem: Those are TEXT tokens (40="I", 1842="love", 2508="pie") - the model is doing text continuation, not TTS!
+
+  The fundamental issue: TRT-LLM's generate() uses its internal lm_head (tied to text vocab), not our external speech_head. It's generating text, not speech.
+
+  To use TRT for the transformer backbone only while handling speech embedding/head externally, we need a different approach - manual autoregressive loop. Let me fix this:
+
+⏺ Update(test_trt_inference.py)
+  ⎿  Added 30 lines, removed 24 lines                                    
+      110      ) -> torch.Tensor:                                        
+      111          """                                                   
+      112          Generate speech tokens from text using TRT-LLM.       
+      113 +                                                              
+      114 +        NOTE: TRT-LLM's generate() uses its internal lm_head  
+          +which is tied to text vocab.                                  
+      115 +        For proper TTS, we need to use the transformer        
+          +backbone only and apply                                       
+      116 +        speech_head externally. This requires manual          
+          +autoregressive generation.                                    
+      117 +                                                              
+      118 +        For now, this implementation shows the TRT-LLM        
+          +generate working, but                                         
+      119 +        produces TEXT tokens, not SPEECH tokens. A proper     
+          +implementation would                                          
+      120 +        need to use TRT-LLM's session-based API or export     
+          +just the backbone.                                            
+      121          """                                                   
+      122          logger.info(f"Generating speech from                  
+           {text_token_ids.shape[1]} text tokens...")                    
+      123 +        logger.warning("NOTE: TRT-LLM generate() produces     
+          +TEXT tokens, not speech tokens!")                             
+      124 +        logger.warning("For proper TTS, need manual           
+          +autoregressive loop with external speech_head")               
+      125                                                                
+      126          # Ensure input is on correct device and format        
+      127          if text_token_ids.dim() == 1:                         
+     ...
+      134          # Extract output - handle various return formats      
+      135          logger.info(f"Output type: {type(output)}")           
+      136                                                                
+      137 -        if hasattr(output, 'output_ids'):                     
+      138 -            # GenerationOutput object                         
+      137 +        if isinstance(output, torch.Tensor):                  
+      138 +            # Shape is typically (batch, seq_len)             
+      139 +            generated = output[0].cpu().tolist()              
+      140 +        elif hasattr(output, 'output_ids'):                   
+      141              output_ids = output.output_ids                    
+      142 -            logger.info(f"output_ids type:                    
+          -{type(output_ids)}, len: {len(output_ids) if                  
+          -hasattr(output_ids, '__len__') else 'N/A'}")                  
+      143 -            if isinstance(output_ids, list):                  
+      142 +            if isinstance(output_ids, torch.Tensor):          
+      143 +                generated = output_ids[0].cpu().tolist()      
+      144 +            elif isinstance(output_ids, list):                
+      145                  generated = output_ids[0]                     
+      146 -            else:                                             
+      147 -                generated = output_ids[0]                     
+      148 -            if hasattr(generated, 'cpu'):                     
+      149 -                generated = generated.cpu().tolist()          
+      150 -            elif hasattr(generated, 'tolist'):                
+      151 -                generated = generated.tolist()                
+      146 +                if isinstance(generated, torch.Tensor):       
+      147 +                    generated = generated.cpu().tolist()      
+      148 +                elif isinstance(generated, list) and          
+          +len(generated) > 0 and isinstance(generated[0], list):        
+      149 +                    generated = generated[0]  # Unwrap nested 
+          + list                                                         
+      150          elif isinstance(output, dict) and 'output_ids' in     
+           output:                                                       
+      151              generated = output['output_ids'][0]               
+      152              if hasattr(generated, 'cpu'):                     
+      153                  generated = generated.cpu().tolist()          
+      154 -        elif isinstance(output, torch.Tensor):                
+      155 -            generated = output[0].cpu().tolist()              
+      156 -        elif isinstance(output, list):                        
+      157 -            generated = output[0]                             
+      158 -            if hasattr(generated, 'cpu'):                     
+      159 -                generated = generated.cpu().tolist()          
+      160 -            elif hasattr(generated, 'tolist'):                
+      161 -                generated = generated.tolist()                
+      154          else:                                                 
+      155              logger.warning(f"Unknown output format:           
+           {type(output)}")                                              
+      156 -            generated = list(output)                          
+      156 +            generated = []                                    
+      157                                                                
+      158 -        logger.info(f"Raw generated tokens (first 20):        
+          -{generated[:20] if len(generated) > 20 else generated}")      
+      158 +        # Flatten if still nested                             
+      159 +        if isinstance(generated, list) and len(generated) > 0 
+          + and isinstance(generated[0], list):                          
+      160 +            generated = generated[0]                          
+      161                                                                
+      162 -        # Filter to valid speech tokens                       
+      163 -        speech_tokens = [t for t in generated if 0 <= t <     
+          -self.speech_vocab_size]                                       
+      162 +        logger.info(f"Generated {len(generated)} tokens")     
+      163 +        logger.info(f"Raw tokens (first 20): {generated[:20]  
+          +if len(generated) > 20 else generated}")                      
+      164                                                                
+      165 -        logger.info(f"Generated {len(speech_tokens)} speech   
+          -tokens")                                                      
+      166 -        return torch.tensor(speech_tokens, dtype=torch.long,  
+          -device=self.device)                                           
+      165 +        # These are TEXT tokens from TRT-LLM's internal       
+          +lm_head, not speech tokens!                                   
+      166 +        # Return them anyway for diagnostic purposes          
+      167 +        return torch.tensor(generated, dtype=torch.long,      
+          +device=self.device)                                           
+      168                                                                
+      169                                                                
+      170  class T3TRTInferenceSimple:                                   
+
+⏺ Here's the situation:
+
+  The Core Problem: TRT-LLM is designed for standard LLMs where:
+  - One embedding table → transformer → same embedding table as lm_head
+  - Generate text tokens
+
+  T3 TTS needs:
+  - Text embedding for input text tokens
+  - Speech embedding for generated speech tokens (different vocab!)
+  - Transformer backbone
+  - Speech head (projects to speech vocab, not text vocab)
+
+  TRT-LLM's generate() hardcodes the text → text loop. We can't inject our speech_head.
+
+  Options to actually accelerate T3:
+
+  1. Pure TensorRT (not TRT-LLM): Export just the transformer backbone to TensorRT, handle embeddings and speech_head in PyTorch, do manual autoregressive loop
+  2. torch.compile / CUDA graphs: Simpler, keep everything in PyTorch but compile the hot path
+  3. ONNX Runtime: Export backbone to ONNX, similar to option 1
+  4. Custom TRT-LLM: Would require writing custom plugins for the dual-vocab architecture
+
+  Which approach do you want to pursue? Option 2 (torch.compile) is quickest to test and often gives 2-3x speedup with minimal code changes.
+
+
+

@@ -44,7 +44,8 @@ model = ChatterboxTurboTRT.from_pretrained(
 model.export_for_trtllm('./t3_export')
 "
 
-
+scp -i ./pair.pem /Users/sethlupo/Public/new-bot/martha/test_trt_inference.py  ec2-user@13.217.94.252:/home/ec2-user/workspace/
+scp -i ./pair.pem ec2-user@13.217.94.252:/home/ec2-user/workspace/output_trt.wav  /Users/sethlupo/Public/new-bot/martha/
 
 rm -rf t3_export && \
 python -c "
@@ -65,3 +66,174 @@ trtllm-build \
     --max_input_len 512 \
     --max_seq_len 4096 \
     --max_batch_size 1
+
+Role: You are acting as a senior ML systems engineer with deep experience in TensorRT-LLM, decoder-only
+  transformers, and TTS architectures.
+
+  Objective: Perform a surgical refactor of the Chatterbox Turbo (T3) codebase so that it can be exported and run on
+  TensorRT-LLM, without retraining, while preserving existing model weights and quality, by hard-coding voice
+  conditioning at compile time.
+
+  🔒 HARD CONSTRAINTS (NON-NEGOTIABLE)
+
+  TensorRT-LLM does NOT allow runtime inputs_embeds.
+
+  Only input_ids may be provided at inference time.
+
+  All embeddings must be either:
+
+  token embeddings owned by the model, or
+
+  compile-time prompt embeddings (prompt-tuning tables).
+
+  Text must remain fully dynamic at runtime.
+
+  Arbitrary text input via the existing tokenizer.
+
+  No text retraining.
+
+  Voice conditioning must be FIXED.
+
+  One voice per engine build.
+
+  Conditioning embeddings must be baked into the model / engine at compile time.
+
+  Existing pretrained weights must be reused exactly.
+
+  No finetuning.
+
+  No architectural retraining.
+
+  Only refactoring and graph restructuring is allowed.
+
+  🧠 KEY INSIGHT YOU MUST FOLLOW
+
+  Chatterbox Turbo does NOT contextualize text outside the LLM.
+
+  The tokenizer is purely lexical.
+
+  Text “encoder” is just an nn.Embedding.
+
+  All contextualization happens inside the GPT-2 / LLaMA backbone.
+
+  The only incompatibility with TensorRT-LLM is that Turbo currently:
+
+  concatenates (cond_emb + text_emb + speech_emb)
+  and passes them via inputs_embeds
+
+
+  TensorRT-LLM forbids this.
+
+  🎯 TARGET ARCHITECTURE (MUST MATCH EXACTLY)
+  At TRAIN / EXPORT TIME
+  [ FIXED VOICE PREFIX EMBEDDINGS ]  ← baked into engine
+  +
+  [ TOKEN EMBEDDINGS from input_ids ]
+  →
+  TRANSFORMER BACKBONE
+  →
+  SPEECH TOKENS
+
+
+  Voice prefix is constant.
+
+  Text tokens go through the standard embedding table.
+
+  No runtime embedding concatenation.
+
+  🛠 REQUIRED SURGERY STEPS
+
+  You must implement all of the following:
+
+  1️⃣ Extract Conditioning Prefix (Offline, Once)
+
+  Run the existing Turbo model in PyTorch.
+
+  Pass a reference voice through the conditioning path.
+
+  Capture the final projected conditioning embeddings exactly at the point where they are concatenated before
+  inputs_embeds.
+
+  Save them as a float16 tensor:
+
+  shape: [P, hidden_size]
+
+  2️⃣ Remove Runtime Conditioning From Forward Pass
+
+  In the model code:
+
+  ❌ REMOVE:
+
+  cond_emb = self.cond_enc(...)
+  embeds = torch.cat([cond_emb, text_emb, speech_emb], dim=1)
+
+
+  ✅ REPLACE WITH:
+
+  embeds = torch.cat([text_emb, speech_emb], dim=1)
+
+
+  The model must now be purely token-driven.
+
+  No conditioning logic may remain in forward.
+
+  3️⃣ Convert Model to TRUE Decoder-Only Form
+
+  The model must:
+
+  accept only input_ids
+
+  own its embedding table
+
+  perform positional encoding internally
+
+  There must be zero references to inputs_embeds anywhere.
+
+  4️⃣ Integrate Conditioning as Compile-Time Prompt Table
+
+  Treat the extracted voice prefix as a prompt-tuning table entry.
+
+  Freeze it.
+
+  Configure the engine so that:
+
+  prompt_id = 0
+  prompt_table[0] = fixed_voice_prefix
+
+
+  The prefix length must be fixed and known at build time.
+
+  5️⃣ Ensure TensorRT-LLM Compatibility
+
+  Final model must satisfy:
+
+  single embedding lookup path
+
+  no dynamic embeddings
+
+  static prompt prefix
+
+  valid KV cache layout
+
+  standard autoregressive decoding
+
+
+
+python3 -c "
+from src.chatterbox.tts_turbo_trt import ChatterboxTurboTRT
+model = ChatterboxTurboTRT.from_pretrained('cuda', 'voice_ref.wav')
+model.export_for_trtllm('./t3_export_unified')
+"
+
+# 2. Re-build TRT engine
+trtllm-build \
+--checkpoint_dir ./t3_export_unified \
+--output_dir ./t3_engine_unified \
+--gpt_attention_plugin float16 \
+--gemm_plugin float16
+
+# 3. Test
+python3 test_trt_inference.py \
+--engine_dir ./t3_engine_unified \
+--export_dir ./t3_export_unified \
+--text "Hello world"

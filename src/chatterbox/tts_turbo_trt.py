@@ -889,12 +889,21 @@ class ChatterboxTurboTRT:
 
     def export_for_trtllm(self, output_dir: str):
         """
-        Export model for TensorRT-LLM.
+        Export model for TensorRT-LLM with UNIFIED EMBEDDING.
+
+        UNIFIED EMBEDDING LAYOUT (speech-first):
+            [0, speech_vocab_size)     = speech tokens (output, generated)
+            [speech_vocab_size, total) = text tokens (input, offset)
+
+        This enables TRT-LLM's native generation loop:
+            - Text input: original_text_id + speech_vocab_size (offset at input)
+            - Speech output: 0 to speech_vocab_size-1 (feed directly back)
 
         Creates:
             - config.json: TRT-LLM compatible config
-            - rank0.safetensors: Model weights in TRT-LLM format
+            - rank0.safetensors: Model weights with unified embedding
             - prompt_table.npy: Baked voice prefix for ptuning
+            - t3_metadata.json: Offset info for inference
         """
         import json
         from safetensors.torch import save_file
@@ -902,9 +911,15 @@ class ChatterboxTurboTRT:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # TRT-LLM config format
-        # vocab_size = text_vocab_size for input embedding
-        # We handle speech output head separately (saved as speech_head.npy)
+        speech_vocab = self.t3.config.speech_vocab_size  # 6563
+        text_vocab = self.t3.config.text_vocab_size      # 50276
+        unified_vocab = speech_vocab + text_vocab        # 56839
+
+        logger.info(f"Creating unified embedding:")
+        logger.info(f"  Speech tokens: [0, {speech_vocab}) - output/generated")
+        logger.info(f"  Text tokens: [{speech_vocab}, {unified_vocab}) - input (offset by {speech_vocab})")
+
+        # TRT-LLM config with unified vocab and SEPARATE lm_head
         config = {
             "architecture": "GPTForCausalLM",
             "dtype": "float16",
@@ -913,12 +928,12 @@ class ChatterboxTurboTRT:
             "hidden_size": self.t3.config.hidden_size,
             "intermediate_size": self.t3.config.hidden_size * 4,
             "num_key_value_heads": self.t3.config.num_heads,
-            "vocab_size": self.t3.config.text_vocab_size,  # Input vocab (text)
+            "vocab_size": unified_vocab,  # UNIFIED: speech + text
             "position_embedding_type": "learned_absolute",
             "max_position_embeddings": 8196,
             "hidden_act": "gelu",
             "norm_epsilon": 1e-5,
-            "share_embedding_table": True,  # Tie lm_head to vocab_embedding
+            "share_embedding_table": False,  # SEPARATE lm_head for speech output
             "mapping": {
                 "world_size": 1,
                 "tp_size": 1,
@@ -929,41 +944,167 @@ class ChatterboxTurboTRT:
             },
             # Custom fields for T3
             "t3_config": {
-                "text_vocab_size": self.t3.config.text_vocab_size,
-                "speech_vocab_size": self.t3.config.speech_vocab_size,
+                "text_vocab_size": text_vocab,
+                "speech_vocab_size": speech_vocab,
+                "unified_vocab_size": unified_vocab,
+                "text_token_offset": speech_vocab,  # Text tokens are offset by this
                 "voice_prefix_len": self.t3._voice_prefix_len,
             }
         }
         with open(output_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)
-        logger.info(f"Saved TRT-LLM config")
+        logger.info(f"Saved TRT-LLM config (unified vocab_size={unified_vocab})")
 
         # Save voice prefix as prompt table (for ptuning)
         voice_prefix = self.t3._voice_prefix.squeeze(0).cpu().half().numpy()
         np.save(output_dir / "prompt_table.npy", voice_prefix)
         logger.info(f"Saved prompt table: shape={voice_prefix.shape}")
 
-        # Save speech embedding separately (for custom runtime handling)
-        speech_emb = self.t3.speech_emb.weight.detach().cpu().half().numpy()
-        np.save(output_dir / "speech_embedding.npy", speech_emb)
-        logger.info(f"Saved speech embedding: shape={speech_emb.shape}")
+        # Save T3 metadata for inference
+        t3_metadata = {
+            "speech_vocab_size": speech_vocab,
+            "text_vocab_size": text_vocab,
+            "unified_vocab_size": unified_vocab,
+            "text_token_offset": speech_vocab,
+            "voice_prefix_len": self.t3._voice_prefix_len,
+            "stop_speech_token": self.t3.config.stop_speech_token,
+            "start_speech_token": self.t3.config.start_speech_token,
+        }
+        with open(output_dir / "t3_metadata.json", "w") as f:
+            json.dump(t3_metadata, f, indent=2)
+        logger.info(f"Saved T3 metadata")
 
-        # Save speech head separately (TRT-LLM GPT uses tied lm_head, we need custom output)
-        speech_head_w = self.t3.speech_head.weight.detach().cpu().half().numpy()
-        speech_head_b = self.t3.speech_head.bias.detach().cpu().half().numpy()
-        np.savez(output_dir / "speech_head.npz", weight=speech_head_w, bias=speech_head_b)
-        logger.info(f"Saved speech head: weight={speech_head_w.shape}, bias={speech_head_b.shape}")
-
-        # Convert weights to TRT-LLM naming convention
-        trtllm_weights = self._convert_weights_to_trtllm()
+        # Convert weights to TRT-LLM naming convention with UNIFIED embedding
+        trtllm_weights = self._convert_weights_to_trtllm_unified()
         save_file(trtllm_weights, output_dir / "rank0.safetensors")
         logger.info(f"Saved TRT-LLM weights: {len(trtllm_weights)} tensors")
 
         logger.info(f"Exported TRT-LLM checkpoint to {output_dir}")
+        logger.info(f"")
+        logger.info(f"=== INFERENCE USAGE ===")
+        logger.info(f"Text tokens must be OFFSET by {speech_vocab}:")
+        logger.info(f"  input_ids = original_text_ids + {speech_vocab}")
+        logger.info(f"Generated speech tokens (0-{speech_vocab-1}) feed back directly.")
         return output_dir
 
+    def _convert_weights_to_trtllm_unified(self) -> dict:
+        """
+        Convert model weights to TRT-LLM with UNIFIED EMBEDDING.
+
+        Creates:
+            - vocab_embedding: [speech_emb; text_emb] (speech first, then text)
+            - lm_head: speech_head weights (outputs speech vocab only)
+        """
+        import torch
+        trtllm_weights = {}
+
+        speech_vocab = self.t3.config.speech_vocab_size  # 6563
+        text_vocab = self.t3.config.text_vocab_size      # 50276
+        unified_vocab = speech_vocab + text_vocab        # 56839
+
+        # === CREATE UNIFIED EMBEDDING ===
+        # Layout: [0, speech_vocab) = speech_emb
+        #         [speech_vocab, speech_vocab + text_vocab) = text_emb
+        speech_emb = self.t3.speech_emb.weight.detach().cpu().half()  # (6563, 1024)
+        text_emb = self.t3.text_emb.weight.detach().cpu().half()      # (50276, 1024)
+
+        unified_emb = torch.cat([speech_emb, text_emb], dim=0)  # (56839, 1024)
+        trtllm_weights["transformer.vocab_embedding.weight"] = unified_emb.contiguous()
+        logger.info(f"Created unified embedding: {unified_emb.shape}")
+
+        # === CREATE LM_HEAD FROM SPEECH_HEAD ===
+        # TRT-LLM expects lm_head to match vocab_embedding size (56839)
+        # We pad speech_head (6563) with zeros for text token positions
+        # The text logits won't be used - we filter to speech tokens at inference
+        speech_head_w = self.t3.speech_head.weight.detach().cpu().half()  # (6563, 1024)
+        speech_head_b = self.t3.speech_head.bias.detach().cpu().half()    # (6563,)
+
+        # Pad to unified vocab size
+        hidden_size = speech_head_w.shape[1]
+        lm_head_w_padded = torch.zeros(unified_vocab, hidden_size, dtype=torch.float16)
+        lm_head_b_padded = torch.zeros(unified_vocab, dtype=torch.float16)
+
+        # Speech head goes in first speech_vocab positions (0 to 6562)
+        lm_head_w_padded[:speech_vocab, :] = speech_head_w
+        lm_head_b_padded[:speech_vocab] = speech_head_b
+
+        trtllm_weights["lm_head.weight"] = lm_head_w_padded.contiguous()
+        trtllm_weights["lm_head.bias"] = lm_head_b_padded.contiguous()
+        logger.info(f"Created padded lm_head: {lm_head_w_padded.shape} (speech_head padded from {speech_head_w.shape})")
+
+        # === CONVERT TRANSFORMER WEIGHTS ===
+        state_dict = self.t3.state_dict()
+
+        for name, param in state_dict.items():
+            param = param.cpu().half().contiguous()
+
+            # Skip buffers and already-handled weights
+            if name == "_voice_prefix":
+                continue
+            if name.startswith("text_emb.") or name.startswith("speech_emb."):
+                continue  # Already in unified embedding
+            if name.startswith("speech_head."):
+                continue  # Already in lm_head
+            if name.startswith("spkr_enc."):
+                continue  # Not needed for inference
+
+            # Map transformer weights
+            if name.startswith("transformer.h."):
+                parts = name.split(".")
+                layer_idx = parts[2]
+                component = ".".join(parts[3:])
+
+                # TRT-LLM GPT naming convention
+                if component == "ln_1.weight":
+                    new_name = f"transformer.layers.{layer_idx}.input_layernorm.weight"
+                elif component == "ln_1.bias":
+                    new_name = f"transformer.layers.{layer_idx}.input_layernorm.bias"
+                elif component == "ln_2.weight":
+                    new_name = f"transformer.layers.{layer_idx}.post_layernorm.weight"
+                elif component == "ln_2.bias":
+                    new_name = f"transformer.layers.{layer_idx}.post_layernorm.bias"
+                elif component == "attn.c_attn.weight":
+                    new_name = f"transformer.layers.{layer_idx}.attention.qkv.weight"
+                    param = param.t().contiguous()
+                elif component == "attn.c_attn.bias":
+                    new_name = f"transformer.layers.{layer_idx}.attention.qkv.bias"
+                elif component == "attn.c_proj.weight":
+                    new_name = f"transformer.layers.{layer_idx}.attention.dense.weight"
+                    param = param.t().contiguous()
+                elif component == "attn.c_proj.bias":
+                    new_name = f"transformer.layers.{layer_idx}.attention.dense.bias"
+                elif component == "mlp.c_fc.weight":
+                    new_name = f"transformer.layers.{layer_idx}.mlp.fc.weight"
+                    param = param.t().contiguous()
+                elif component == "mlp.c_fc.bias":
+                    new_name = f"transformer.layers.{layer_idx}.mlp.fc.bias"
+                elif component == "mlp.c_proj.weight":
+                    new_name = f"transformer.layers.{layer_idx}.mlp.proj.weight"
+                    param = param.t().contiguous()
+                elif component == "mlp.c_proj.bias":
+                    new_name = f"transformer.layers.{layer_idx}.mlp.proj.bias"
+                else:
+                    new_name = name
+                    logger.warning(f"Unknown transformer component: {component}")
+
+                trtllm_weights[new_name] = param
+
+            elif name.startswith("transformer.ln_f."):
+                if "weight" in name:
+                    trtllm_weights["transformer.ln_f.weight"] = param
+                else:
+                    trtllm_weights["transformer.ln_f.bias"] = param
+
+            elif name.startswith("transformer.wpe."):
+                trtllm_weights["transformer.position_embedding.weight"] = param
+
+            else:
+                logger.warning(f"Skipping unknown weight: {name}")
+
+        return trtllm_weights
+
     def _convert_weights_to_trtllm(self) -> dict:
-        """Convert model weights to TRT-LLM naming convention for GPTForCausalLM."""
+        """DEPRECATED: Use _convert_weights_to_trtllm_unified instead."""
         trtllm_weights = {}
 
         # Get state dict
