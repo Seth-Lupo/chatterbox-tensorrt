@@ -919,7 +919,15 @@ class ChatterboxTurboTRT:
         logger.info(f"  Speech tokens: [0, {speech_vocab}) - output/generated")
         logger.info(f"  Text tokens: [{speech_vocab}, {unified_vocab}) - input (offset by {speech_vocab})")
 
-        # TRT-LLM config with unified vocab and SEPARATE lm_head
+        voice_prefix_len = self.t3._voice_prefix_len  # 251
+
+        # NEW: Voice prefix is embedded as virtual tokens
+        # Layout: [voice_prefix (251), speech_emb (6563), text_emb (50276)]
+        speech_offset = voice_prefix_len  # 251
+        text_offset = voice_prefix_len + speech_vocab  # 6814
+        total_vocab = voice_prefix_len + speech_vocab + text_vocab  # 57090
+
+        # TRT-LLM config with unified vocab
         config = {
             "architecture": "GPTForCausalLM",
             "dtype": "float16",
@@ -928,12 +936,12 @@ class ChatterboxTurboTRT:
             "hidden_size": self.t3.config.hidden_size,
             "intermediate_size": self.t3.config.hidden_size * 4,
             "num_key_value_heads": self.t3.config.num_heads,
-            "vocab_size": unified_vocab,  # UNIFIED: speech + text
+            "vocab_size": total_vocab,  # 57090: voice_prefix + speech + text
             "position_embedding_type": "learned_absolute",
             "max_position_embeddings": 8196,
             "hidden_act": "gelu",
             "norm_epsilon": 1e-5,
-            "share_embedding_table": False,  # SEPARATE lm_head for speech output
+            "share_embedding_table": False,  # SEPARATE lm_head
             "mapping": {
                 "world_size": 1,
                 "tp_size": 1,
@@ -946,29 +954,26 @@ class ChatterboxTurboTRT:
             "t3_config": {
                 "text_vocab_size": text_vocab,
                 "speech_vocab_size": speech_vocab,
-                "unified_vocab_size": unified_vocab,
-                "text_token_offset": speech_vocab,  # Text tokens are offset by this
-                "voice_prefix_len": self.t3._voice_prefix_len,
+                "voice_prefix_len": voice_prefix_len,
+                "speech_offset": speech_offset,  # 251 - speech tokens start here
+                "text_offset": text_offset,      # 6814 - text tokens start here
+                "total_vocab_size": total_vocab,  # 57090
             }
         }
         with open(output_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)
-        logger.info(f"Saved TRT-LLM config (unified vocab_size={unified_vocab})")
-
-        # Save voice prefix as prompt table (for ptuning)
-        voice_prefix = self.t3._voice_prefix.squeeze(0).cpu().half().numpy()
-        np.save(output_dir / "prompt_table.npy", voice_prefix)
-        logger.info(f"Saved prompt table: shape={voice_prefix.shape}")
+        logger.info(f"Saved TRT-LLM config (vocab_size={total_vocab})")
 
         # Save T3 metadata for inference
         t3_metadata = {
             "speech_vocab_size": speech_vocab,
             "text_vocab_size": text_vocab,
-            "unified_vocab_size": unified_vocab,
-            "text_token_offset": speech_vocab,
-            "voice_prefix_len": self.t3._voice_prefix_len,
-            "stop_speech_token": self.t3.config.stop_speech_token,
-            "start_speech_token": self.t3.config.start_speech_token,
+            "voice_prefix_len": voice_prefix_len,
+            "speech_offset": speech_offset,  # 251 - generated speech tokens start here
+            "text_offset": text_offset,      # 6814 - text input tokens start here
+            "total_vocab_size": total_vocab,  # 57090
+            "stop_speech_token": self.t3.config.stop_speech_token + speech_offset,  # offset to match lm_head
+            "start_speech_token": self.t3.config.start_speech_token + speech_offset,
         }
         with open(output_dir / "t3_metadata.json", "w") as f:
             json.dump(t3_metadata, f, indent=2)
@@ -991,31 +996,44 @@ class ChatterboxTurboTRT:
         """
         Convert model weights to TRT-LLM with UNIFIED EMBEDDING.
 
-        Creates:
-            - vocab_embedding: [speech_emb; text_emb] (speech first, then text)
-            - lm_head: speech_head weights (outputs speech vocab only)
+        NEW LAYOUT (voice prefix as virtual tokens):
+            [0, voice_prefix_len):                    voice_prefix embeddings (virtual tokens)
+            [voice_prefix_len, voice_prefix_len + speech_vocab): speech_emb
+            [voice_prefix_len + speech_vocab, total):            text_emb
+
+        This embeds the voice prefix directly into the embedding table so it's
+        GUARANTEED to be used when we prepend virtual token IDs [0, 1, ..., 250].
         """
         import torch
         trtllm_weights = {}
 
+        voice_prefix_len = self.t3._voice_prefix_len   # 251
         speech_vocab = self.t3.config.speech_vocab_size  # 6563
         text_vocab = self.t3.config.text_vocab_size      # 50276
-        unified_vocab = speech_vocab + text_vocab        # 56839
+
+        # New offsets
+        speech_offset = voice_prefix_len  # 251
+        text_offset = voice_prefix_len + speech_vocab  # 251 + 6563 = 6814
+        unified_vocab = voice_prefix_len + speech_vocab + text_vocab  # 251 + 6563 + 50276 = 57090
+
+        logger.info(f"Creating unified embedding with voice prefix as virtual tokens:")
+        logger.info(f"  [0, {voice_prefix_len}): voice_prefix (virtual tokens)")
+        logger.info(f"  [{speech_offset}, {text_offset}): speech_emb")
+        logger.info(f"  [{text_offset}, {unified_vocab}): text_emb")
 
         # === CREATE UNIFIED EMBEDDING ===
-        # Layout: [0, speech_vocab) = speech_emb
-        #         [speech_vocab, speech_vocab + text_vocab) = text_emb
+        voice_prefix = self.t3._voice_prefix.squeeze(0).detach().cpu().half()  # (251, 1024)
         speech_emb = self.t3.speech_emb.weight.detach().cpu().half()  # (6563, 1024)
         text_emb = self.t3.text_emb.weight.detach().cpu().half()      # (50276, 1024)
 
-        unified_emb = torch.cat([speech_emb, text_emb], dim=0)  # (56839, 1024)
+        # Concatenate: [voice_prefix, speech_emb, text_emb]
+        unified_emb = torch.cat([voice_prefix, speech_emb, text_emb], dim=0)  # (57090, 1024)
         trtllm_weights["transformer.vocab_embedding.weight"] = unified_emb.contiguous()
         logger.info(f"Created unified embedding: {unified_emb.shape}")
 
         # === CREATE LM_HEAD FROM SPEECH_HEAD ===
-        # TRT-LLM expects lm_head to match vocab_embedding size (56839)
-        # We pad speech_head (6563) with zeros for text token positions
-        # The text logits won't be used - we filter to speech tokens at inference
+        # lm_head outputs logits - we want speech tokens to map to [speech_offset, speech_offset + speech_vocab)
+        # But for simplicity, we'll output logits for the full vocab and filter at inference
         speech_head_w = self.t3.speech_head.weight.detach().cpu().half()  # (6563, 1024)
         speech_head_b = self.t3.speech_head.bias.detach().cpu().half()    # (6563,)
 
@@ -1024,13 +1042,14 @@ class ChatterboxTurboTRT:
         lm_head_w_padded = torch.zeros(unified_vocab, hidden_size, dtype=torch.float16)
         lm_head_b_padded = torch.zeros(unified_vocab, dtype=torch.float16)
 
-        # Speech head goes in first speech_vocab positions (0 to 6562)
-        lm_head_w_padded[:speech_vocab, :] = speech_head_w
-        lm_head_b_padded[:speech_vocab] = speech_head_b
+        # Speech head maps to positions [speech_offset, speech_offset + speech_vocab)
+        # This way generated tokens are in range [251, 6814) and we subtract 251 to get speech token
+        lm_head_w_padded[speech_offset:speech_offset + speech_vocab, :] = speech_head_w
+        lm_head_b_padded[speech_offset:speech_offset + speech_vocab] = speech_head_b
 
         trtllm_weights["lm_head.weight"] = lm_head_w_padded.contiguous()
         trtllm_weights["lm_head.bias"] = lm_head_b_padded.contiguous()
-        logger.info(f"Created padded lm_head: {lm_head_w_padded.shape} (speech_head padded from {speech_head_w.shape})")
+        logger.info(f"Created padded lm_head: {lm_head_w_padded.shape}")
 
         # === CONVERT TRANSFORMER WEIGHTS ===
         state_dict = self.t3.state_dict()

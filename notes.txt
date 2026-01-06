@@ -222,18 +222,18 @@ Role: You are acting as a senior ML systems engineer with deep experience in Ten
 python3 -c "
 from src.chatterbox.tts_turbo_trt import ChatterboxTurboTRT
 model = ChatterboxTurboTRT.from_pretrained('cuda', 'voice_ref.wav')
-model.export_for_trtllm('./t3_export_unified')
+model.export_for_trtllm('./t3_export_v2')
 "
 
-# 2. Re-build TRT engine
+  # 2. Rebuild engine (vocab_size is now 57090)
 trtllm-build \
---checkpoint_dir ./t3_export_unified \
---output_dir ./t3_engine_unified \
+--checkpoint_dir ./t3_export_v2 \
+--output_dir ./t3_engine_v2 \
 --gpt_attention_plugin float16 \
 --gemm_plugin float16
 
 # 3. Test
 python3 test_trt_inference.py \
---engine_dir ./t3_engine_unified \
---export_dir ./t3_export_unified \
---text "Hello world"
+--engine_dir ./t3_engine_v2 \
+--export_dir ./t3_export_v2 \
+--text "Hello world, I love cake!"

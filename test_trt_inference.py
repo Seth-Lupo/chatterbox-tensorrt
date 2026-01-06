@@ -36,13 +36,15 @@ class T3TRTInference:
     """
     TensorRT-LLM inference wrapper for T3 TTS with UNIFIED EMBEDDING.
 
-    Architecture:
-    - Unified vocab_embedding: [speech_emb (6563); text_emb (50276)]
-    - lm_head outputs speech logits (6563 tokens)
-    - Text input tokens offset by speech_vocab_size
-    - Speech output tokens (0-6562) feed back directly
+    NEW Architecture (voice prefix as virtual tokens):
+    - Unified vocab_embedding layout:
+        [0, 251):        voice_prefix embeddings (virtual tokens)
+        [251, 6814):     speech_emb
+        [6814, 57090):   text_emb
+    - lm_head outputs logits with speech at [251, 6814)
+    - Voice prefix is GUARANTEED by prepending tokens [0, 1, ..., 250] to input
 
-    This allows TRT-LLM's native generation loop to work for TTS.
+    This embeds voice conditioning directly into the input sequence.
     """
 
     def __init__(
@@ -68,17 +70,25 @@ class T3TRTInference:
             self.metadata = config.get("t3_config", {})
             logger.info(f"Using t3_config from config.json: {self.metadata}")
 
-        # Extract key parameters
+        # Extract key parameters (NEW layout)
+        self.voice_prefix_len = self.metadata.get("voice_prefix_len", 251)
         self.speech_vocab_size = self.metadata.get("speech_vocab_size", 6563)
         self.text_vocab_size = self.metadata.get("text_vocab_size", 50276)
-        self.text_token_offset = self.metadata.get("text_token_offset", self.speech_vocab_size)
-        self.stop_speech_token = self.metadata.get("stop_speech_token", 6562)
-        self.start_speech_token = self.metadata.get("start_speech_token", 6561)
+        self.speech_offset = self.metadata.get("speech_offset", 251)
+        self.text_offset = self.metadata.get("text_offset", 6814)
+        self.stop_speech_token = self.metadata.get("stop_speech_token", 6562 + 251)
+        self.start_speech_token = self.metadata.get("start_speech_token", 6561 + 251)
 
-        logger.info(f"Unified embedding layout:")
-        logger.info(f"  Speech tokens: [0, {self.speech_vocab_size})")
-        logger.info(f"  Text tokens: [{self.text_token_offset}, {self.text_token_offset + self.text_vocab_size})")
-        logger.info(f"  Text offset: {self.text_token_offset}")
+        logger.info(f"Unified embedding layout (voice prefix as virtual tokens):")
+        logger.info(f"  [0, {self.voice_prefix_len}): voice_prefix (virtual tokens)")
+        logger.info(f"  [{self.speech_offset}, {self.speech_offset + self.speech_vocab_size}): speech_emb")
+        logger.info(f"  [{self.text_offset}, {self.text_offset + self.text_vocab_size}): text_emb")
+
+        # Create voice prefix token IDs (virtual tokens 0, 1, 2, ..., 250)
+        self.voice_prefix_tokens = torch.arange(
+            self.voice_prefix_len, dtype=torch.int32, device=device
+        )
+        logger.info(f"Voice prefix tokens: [0, {self.voice_prefix_len}) = {self.voice_prefix_len} tokens")
 
         # Load TRT-LLM
         from tensorrt_llm.runtime import ModelRunner
@@ -86,24 +96,16 @@ class T3TRTInference:
         logger.info(f"Loading TRT-LLM engine from {engine_dir}")
         self.runner = ModelRunner.from_dir(engine_dir, rank=0)
 
-        # Load voice prefix (for reference/debugging)
-        prompt_table_path = self.export_dir / "prompt_table.npy"
-        if prompt_table_path.exists():
-            self.voice_prefix = torch.from_numpy(
-                np.load(prompt_table_path)
-            ).to(device).half()
-            logger.info(f"Voice prefix: {self.voice_prefix.shape}")
-
-        logger.info("T3 TRT Inference ready (UNIFIED EMBEDDING)")
+        logger.info("T3 TRT Inference ready (UNIFIED EMBEDDING with voice prefix as virtual tokens)")
 
     def offset_text_tokens(self, text_token_ids: torch.Tensor) -> torch.Tensor:
         """
         Offset text tokens for unified embedding.
 
-        Text tokens are stored at indices [speech_vocab_size, total),
-        so we add speech_vocab_size to the original text token IDs.
+        Text tokens are stored at indices [text_offset, text_offset + text_vocab),
+        so we add text_offset (6814) to the original text token IDs.
         """
-        return text_token_ids + self.text_token_offset
+        return text_token_ids + self.text_offset
 
     @torch.inference_mode()
     def generate(
@@ -117,14 +119,16 @@ class T3TRTInference:
         """
         Generate speech tokens from text using TRT-LLM with UNIFIED EMBEDDING.
 
-        The model now has:
-        - Unified embedding: [speech (0-6562); text (6563-56838)]
-        - lm_head outputs speech logits (6563 tokens)
+        NEW Architecture:
+        - Voice prefix is embedded as virtual tokens [0, 251)
+        - Text tokens are offset to [6814, 57090)
+        - Generated speech tokens are in [251, 6814)
 
         Flow:
-        1. Offset text tokens by speech_vocab_size (6563)
-        2. TRT-LLM generates using native loop
-        3. Output is speech tokens (0-6562) - no offset needed
+        1. Prepend voice prefix tokens [0, 1, ..., 250]
+        2. Offset and append text tokens
+        3. TRT-LLM generates
+        4. Output tokens in [251, 6814) are speech - subtract 251 to get actual token
         """
         logger.info(f"Generating speech from {text_token_ids.shape[1]} text tokens...")
 
@@ -133,22 +137,26 @@ class T3TRTInference:
             text_token_ids = text_token_ids.unsqueeze(0)
 
         # === OFFSET TEXT TOKENS ===
-        # Text tokens need to be offset by speech_vocab_size for unified embedding
-        offset_ids = self.offset_text_tokens(text_token_ids)
+        offset_text = self.offset_text_tokens(text_token_ids[0])  # 1D tensor
         logger.info(f"Original text tokens (first 10): {text_token_ids[0, :10].tolist()}")
-        logger.info(f"Offset text tokens (first 10): {offset_ids[0, :10].tolist()}")
+        logger.info(f"Offset text tokens (first 10): {offset_text[:10].tolist()}")
+
+        # === PREPEND VOICE PREFIX VIRTUAL TOKENS ===
+        # Voice prefix tokens [0, 1, 2, ..., 250] look up the baked voice embeddings
+        full_input = torch.cat([self.voice_prefix_tokens, offset_text.int().cuda()])
+        logger.info(f"Full input: {self.voice_prefix_len} voice tokens + {len(offset_text)} text tokens = {len(full_input)} total")
 
         # TRT-LLM expects batch_input_ids as a LIST of 1D tensors
-        batch_input_ids = [offset_ids[0].int().cuda()]
+        batch_input_ids = [full_input]
 
-        # TRT-LLM generate - now outputs SPEECH tokens directly (0-6562)
+        # TRT-LLM generate - NO prompt_table needed, voice is in input_ids!
         output = self.runner.generate(
             batch_input_ids=batch_input_ids,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-            end_id=self.stop_speech_token,  # 6562
+            end_id=self.stop_speech_token,  # 6562 + 251 = 6813
             pad_id=0,
         )
 
@@ -180,12 +188,17 @@ class T3TRTInference:
             generated = generated[0]
 
         logger.info(f"Generated {len(generated)} total tokens")
+        logger.info(f"Raw tokens (first 30): {generated[:30]}")
 
-        # Filter: keep only speech tokens (0 to speech_vocab_size-1)
-        # This removes the input text tokens and any invalid tokens
-        speech_tokens = [t for t in generated if 0 <= t < self.speech_vocab_size]
+        # Filter: keep only speech tokens in range [speech_offset, speech_offset + speech_vocab)
+        # Then subtract speech_offset to get actual speech token IDs
+        speech_tokens = []
+        for t in generated:
+            if self.speech_offset <= t < self.speech_offset + self.speech_vocab_size:
+                actual_speech_token = t - self.speech_offset
+                speech_tokens.append(actual_speech_token)
 
-        logger.info(f"Filtered to {len(speech_tokens)} speech tokens")
+        logger.info(f"Filtered to {len(speech_tokens)} speech tokens (range [{self.speech_offset}, {self.speech_offset + self.speech_vocab_size}))")
         logger.info(f"Speech tokens (first 20): {speech_tokens[:20] if len(speech_tokens) > 20 else speech_tokens}")
 
         return torch.tensor(speech_tokens, dtype=torch.long, device=self.device)
