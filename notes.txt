@@ -1,0 +1,67 @@
+docker run -d nvcr.io/nvidia/tritonserver:25.12-vllm-python-py3 \ -v /home/ec2-user/workspace:/workspace 
+  
+ ssh -t -i ./pair.pem ec2-user@13.217.94.252  
+
+
+docker run -it \
+  -v /home/ec2-user/workspace:/workspace \
+  --gpus all \
+  nvcr.io/nvidia/tritonserver:25.12-vllm-python-py3 \
+  bash
+
+
+  Next Steps to Use with Real Checkpoint:
+
+  # 1. Extract voice prefix from your trained T3 model
+  from trt import extract_and_save_voice_prefix
+  extract_and_save_voice_prefix(t3_model, speaker_emb, "voice.pt", voice_tokens)
+
+  # 2. Run full export pipeline
+  from trt import full_export_pipeline
+  full_export_pipeline("t3_checkpoint.pth", "voice.pt", "/workspace/trt_export/")
+
+  # 3. Build TensorRT engine
+  # bash /workspace/trt_export/build_engine.sh
+
+
+   python3 test_tts_turbo_trt.py \
+      --voice reference_voice.wav \
+      --output output.wav \
+      --text "Hello! This is a test of the TensorRT compatible TTS system." \
+      --export-dir trt_export/
+
+
+  cd /home/ec2-user/workspace
+  rm -rf t3_export
+python -c "
+from src.chatterbox.tts_turbo_trt import ChatterboxTurboTRT
+
+model = ChatterboxTurboTRT.from_pretrained(
+    device='cuda',
+    voice_audio_path='voice_ref.wav'
+)
+
+model.export_for_trtllm('./t3_export')
+"
+
+
+
+rm -rf t3_export && \
+python -c "
+from src.chatterbox.tts_turbo_trt import ChatterboxTurboTRT
+
+model = ChatterboxTurboTRT.from_pretrained(
+    device='cuda',
+    voice_audio_path='voice_ref.wav'
+)
+
+model.export_for_trtllm('./t3_export')
+" && \
+trtllm-build \
+    --checkpoint_dir ./t3_export \
+    --output_dir ./t3_engine \
+    --gemm_plugin float16 \
+    --gpt_attention_plugin float16 \
+    --max_input_len 512 \
+    --max_seq_len 4096 \
+    --max_batch_size 1
